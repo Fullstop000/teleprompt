@@ -1,0 +1,128 @@
+:root {
+  --ui-font-sans: 'Plus Jakarta Sans', 'Avenir Next', 'Segoe UI', sans-serif;
+  --ui-bg: #f4f6f8;
+  --ui-surface: #ffffff;
+  --ui-text: #1b2430;
+  --ui-muted: #5d6b7c;
+  --ui-line: #d7dee6;
+  --ui-brand: #1171f2;
+  --ui-brand-strong: #0b55ba;
+  --ui-danger: #c9342f;
+  --ui-radius-lg: 16px;
+  --ui-radius-md: 10px;
+  --ui-shadow: 0 12px 36px rgba(12, 33, 56, 0.08);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: var(--ui-font-sans);
+  color: var(--ui-text);
+  background:
+    radial-gradient(1200px 460px at 80% -20%, rgba(17, 113, 242, 0.12), transparent 60%),
+    radial-gradient(800px 360px at -10% 20%, rgba(44, 179, 119, 0.1), transparent 55%),
+    var(--ui-bg);
+}
+
+.ui-container {
+  width: min(980px, 100%);
+  margin: 28px auto;
+  padding: 0 16px;
+}
+
+.ui-card {
+  background: var(--ui-surface);
+  border: 1px solid var(--ui-line);
+  border-radius: var(--ui-radius-lg);
+  box-shadow: var(--ui-shadow);
+}
+
+.ui-section {
+  padding: 18px;
+}
+
+.ui-stack {
+  display: grid;
+  gap: 14px;
+}
+
+.ui-grid {
+  display: grid;
+  gap: 14px;
+}
+
+.ui-grid-2 {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.ui-label {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 13px;
+  font-weight: 700;
+  color: #334154;
+}
+
+.ui-input,
+.ui-select,
+.ui-textarea {
+  width: 100%;
+  min-height: 42px;
+  border: 1px solid var(--ui-line);
+  border-radius: var(--ui-radius-md);
+  background: #fbfcfd;
+  color: var(--ui-text);
+  font: inherit;
+  padding: 10px 12px;
+}
+
+.ui-textarea {
+  resize: vertical;
+}
+
+.ui-input:focus,
+.ui-select:focus,
+.ui-textarea:focus {
+  outline: 2px solid rgba(17, 113, 242, 0.25);
+  border-color: #9dc5ff;
+}
+
+.ui-btn {
+  min-height: 40px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  font: inherit;
+  font-weight: 600;
+  padding: 0 14px;
+  cursor: pointer;
+}
+
+.ui-btn-primary {
+  background: var(--ui-brand);
+  color: #fff;
+}
+
+.ui-btn-primary:hover {
+  background: var(--ui-brand-strong);
+}
+
+.ui-btn-outline {
+  background: #f7faff;
+  border-color: #c6dcff;
+  color: #1f4b95;
+}
+
+.ui-btn-danger {
+  background: #fff4f4;
+  border-color: #f0c8c6;
+  color: var(--ui-danger);
+}
+
+@media (max-width: 760px) {
+  .ui-grid-2 {
+    grid-template-columns: 1fr;
+  }
+}

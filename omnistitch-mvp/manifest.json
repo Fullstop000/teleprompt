@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "OmniStitch MVP",
   "version": "0.1.0",
-  "description": "One-click: open ChatGPT and auto-send prompt with current page URL.",
+  "description": "One-click: jump to ChatGPT or Kimi and auto-send prompt with current page URL.",
   "permissions": [
     "tabs",
     "storage",
@@ -13,7 +13,7 @@
   },
   "options_page": "options.html",
   "action": {
-    "default_title": "Send to ChatGPT"
+    "default_title": "Send to AI"
   },
   "commands": {
     "send-to-chatgpt": {
@@ -21,14 +21,16 @@
         "default": "Ctrl+Shift+L",
         "mac": "Command+Shift+L"
       },
-      "description": "Send active page URL to ChatGPT with the active prompt"
+      "description": "Send active page URL to configured AI target"
     }
   },
   "content_scripts": [
     {
       "matches": [
         "https://chatgpt.com/*",
-        "https://chat.openai.com/*"
+        "https://chat.openai.com/*",
+        "https://www.kimi.com/*",
+        "https://kimi.com/*"
       ],
       "js": [
         "content.js"
