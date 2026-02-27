@@ -4,29 +4,58 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>OmniStitch Prompt 管理</title>
+    <link rel="stylesheet" href="ui-lite.css" />
     <link rel="stylesheet" href="options.css" />
   </head>
   <body>
-    <main class="container">
-      <header>
-        <h1>Prompt 管理</h1>
-        <p>管理一键发送时使用的 Prompt 模板。</p>
+    <main class="ui-container ui-stack">
+      <header class="hero">
+        <h1 class="hero-title">OmniStitch 控制台</h1>
+        <p class="hero-subtitle">管理跳转目标与 Prompt 模板，让一键发送更稳定。</p>
       </header>
 
-      <section class="panel">
-        <h2>新增 Prompt</h2>
-        <form id="create-form">
-          <label for="prompt-title">标题</label>
-          <input id="prompt-title" type="text" maxlength="80" required />
-
-          <label for="prompt-content">内容</label>
-          <textarea id="prompt-content" rows="5" required></textarea>
-
-          <button type="submit">新增</button>
+      <section class="ui-card ui-section ui-stack">
+        <h2>跳转目标</h2>
+        <form id="target-form" class="ui-grid ui-grid-2 target-grid">
+          <div>
+            <span class="ui-label">发送目标（可多选）</span>
+            <div class="target-multi-select">
+              <label class="target-option">
+                <input id="target-chatgpt" type="checkbox" name="target-sites" value="chatgpt" />
+                <span>ChatGPT</span>
+              </label>
+              <label class="target-option">
+                <input id="target-kimi" type="checkbox" name="target-sites" value="kimi" />
+                <span>Kimi</span>
+              </label>
+            </div>
+          </div>
+          <div class="target-action">
+            <button class="ui-btn ui-btn-primary" type="submit">保存目标设置</button>
+          </div>
         </form>
       </section>
 
-      <section class="panel">
+      <section class="ui-card ui-section ui-stack">
+        <h2>新增 Prompt</h2>
+        <form id="create-form" class="ui-grid">
+          <div>
+            <label class="ui-label" for="prompt-title">标题</label>
+            <input class="ui-input" id="prompt-title" type="text" maxlength="80" required />
+          </div>
+
+          <div>
+            <label class="ui-label" for="prompt-content">内容</label>
+            <textarea class="ui-textarea" id="prompt-content" rows="5" required></textarea>
+          </div>
+
+          <div>
+            <button class="ui-btn ui-btn-primary" type="submit">新增 Prompt</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="ui-card ui-section ui-stack">
         <h2>已有 Prompt</h2>
         <p id="status" class="status"></p>
         <ul id="prompt-list" class="prompt-list"></ul>
@@ -34,16 +63,16 @@
     </main>
 
     <template id="prompt-item-template">
-      <li class="prompt-item">
+      <li class="prompt-item ui-stack">
         <div class="item-head">
           <strong class="item-title"></strong>
           <span class="badge">当前使用</span>
         </div>
-        <textarea class="item-content" rows="4"></textarea>
+        <textarea class="item-content ui-textarea" rows="4"></textarea>
         <div class="item-actions">
-          <button class="btn-save">保存</button>
-          <button class="btn-activate">设为当前</button>
-          <button class="btn-delete danger">删除</button>
+          <button class="btn-save ui-btn ui-btn-outline" type="button">保存</button>
+          <button class="btn-activate ui-btn ui-btn-primary" type="button">设为当前</button>
+          <button class="btn-delete ui-btn ui-btn-danger" type="button">删除</button>
         </div>
       </li>
     </template>

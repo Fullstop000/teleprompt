@@ -1,4 +1,6 @@
 const STORAGE_KEY = 'prompt_store_v1';
+const TARGET_STORE_KEY = 'target_site_v1';
+const VALID_TARGET_SITES = ['chatgpt', 'kimi'];
 
 /**
  * Generates a unique id for a prompt item.
@@ -23,6 +25,45 @@ function createDefaultStore() {
       }
     ],
     activePromptId: defaultId
+  };
+}
+
+/**
+ * Creates default target settings for jump destination.
+ * @returns {{targetSites: Array<'chatgpt'|'kimi'>}}
+ */
+function createDefaultTargetSettings() {
+  return {
+    targetSites: ['chatgpt']
+  };
+}
+
+/**
+ * Normalizes target settings and keeps backward compatibility with old single-target schema.
+ * @param {{targetSites?: string[], targetSite?: string}|undefined} settings
+ * @returns {{targetSites: Array<'chatgpt'|'kimi'>}}
+ */
+function normalizeTargetSettings(settings) {
+  const normalizedSet = new Set();
+
+  if (settings && Array.isArray(settings.targetSites)) {
+    for (const site of settings.targetSites) {
+      if (VALID_TARGET_SITES.includes(site)) {
+        normalizedSet.add(site);
+      }
+    }
+  }
+
+  if (settings && typeof settings.targetSite === 'string' && VALID_TARGET_SITES.includes(settings.targetSite)) {
+    normalizedSet.add(settings.targetSite);
+  }
+
+  if (normalizedSet.size === 0) {
+    normalizedSet.add('chatgpt');
+  }
+
+  return {
+    targetSites: Array.from(normalizedSet)
   };
 }
 
@@ -55,6 +96,33 @@ async function loadStore() {
 }
 
 /**
+ * Loads target settings from extension local storage and initializes defaults if missing.
+ * @returns {Promise<{targetSites: Array<'chatgpt'|'kimi'>}>}
+ */
+async function loadTargetSettings() {
+  try {
+    const data = await chrome.storage.local.get(TARGET_STORE_KEY);
+    const normalized = normalizeTargetSettings(data[TARGET_STORE_KEY]);
+    const hasSameShape =
+      data[TARGET_STORE_KEY] &&
+      Array.isArray(data[TARGET_STORE_KEY].targetSites) &&
+      data[TARGET_STORE_KEY].targetSites.length === normalized.targetSites.length &&
+      data[TARGET_STORE_KEY].targetSites.every((site) => normalized.targetSites.includes(site));
+
+    if (!hasSameShape) {
+      await chrome.storage.local.set({ [TARGET_STORE_KEY]: normalized });
+    }
+
+    return normalized;
+  } catch (error) {
+    console.error('Failed to load target settings:', error);
+    const defaultSettings = createDefaultTargetSettings();
+    await chrome.storage.local.set({ [TARGET_STORE_KEY]: defaultSettings });
+    return defaultSettings;
+  }
+}
+
+/**
  * Saves prompt store to extension local storage.
  * @param {{prompts: Array<{id:string,title:string,content:string}>, activePromptId: string}} store
  * @returns {Promise<void>}
@@ -64,6 +132,20 @@ async function saveStore(store) {
     await chrome.storage.local.set({ [STORAGE_KEY]: store });
   } catch (error) {
     console.error('Failed to save prompt store:', error);
+    throw error;
+  }
+}
+
+/**
+ * Saves target settings to extension local storage.
+ * @param {{targetSites: Array<'chatgpt'|'kimi'>}} settings
+ * @returns {Promise<void>}
+ */
+async function saveTargetSettings(settings) {
+  try {
+    await chrome.storage.local.set({ [TARGET_STORE_KEY]: settings });
+  } catch (error) {
+    console.error('Failed to save target settings:', error);
     throw error;
   }
 }
@@ -175,14 +257,43 @@ function setStatus(message) {
  * Initializes options page and event handlers.
  */
 async function init() {
+  const targetForm = document.getElementById('target-form');
+  const targetSiteCheckboxes = document.querySelectorAll('input[name="target-sites"]');
   const form = document.getElementById('create-form');
   const titleInput = document.getElementById('prompt-title');
   const contentInput = document.getElementById('prompt-content');
 
-  if (!form || !titleInput || !contentInput) {
-    console.error('Create form nodes are missing.');
+  if (!targetForm || targetSiteCheckboxes.length === 0 || !form || !titleInput || !contentInput) {
+    console.error('Required options page nodes are missing.');
     return;
   }
+
+  const targetSettings = await loadTargetSettings();
+  for (const checkbox of targetSiteCheckboxes) {
+    checkbox.checked = targetSettings.targetSites.includes(checkbox.value);
+  }
+
+  targetForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+
+    const selectedValues = Array.from(targetSiteCheckboxes)
+      .filter((checkbox) => checkbox.checked)
+      .map((checkbox) => checkbox.value)
+      .filter((site) => VALID_TARGET_SITES.includes(site));
+
+    if (selectedValues.length === 0) {
+      setStatus('请至少选择一个发送目标。');
+      return;
+    }
+
+    try {
+      await saveTargetSettings({ targetSites: selectedValues });
+      const targetLabels = selectedValues.map((site) => (site === 'chatgpt' ? 'ChatGPT' : 'Kimi'));
+      setStatus(`已保存跳转目标：${targetLabels.join('、')}`);
+    } catch (error) {
+      setStatus('保存跳转目标失败，请重试。');
+    }
+  });
 
   const store = await loadStore();
   renderStore(store);

@@ -7,6 +7,47 @@ const MAX_WAIT_MS = 30000;
 const POLL_INTERVAL_MS = 250;
 const DEDUPE_WINDOW_MS = 15000;
 const CONTENT_LOG_PREFIX = '[omnistitch][content]';
+const TARGET_SITE_ADAPTERS = [
+  {
+    id: 'chatgpt',
+    name: 'ChatGPT',
+    hostnames: ['chatgpt.com', 'chat.openai.com'],
+    composerSelectors: [
+      'textarea#prompt-textarea',
+      'textarea[data-id="root"]',
+      'textarea',
+      'div[contenteditable="true"][id="prompt-textarea"]',
+      'div[contenteditable="true"][role="textbox"]',
+      'div[contenteditable="true"]'
+    ],
+    sendButtonSelectors: [
+      'button[data-testid="send-button"]',
+      'button[aria-label*="Send"]',
+      'button[aria-label*="发送"]',
+      'button[type="submit"]'
+    ]
+  },
+  {
+    id: 'kimi',
+    name: 'Kimi',
+    hostnames: ['kimi.com', 'www.kimi.com'],
+    composerSelectors: [
+      'div.chat-input-editor[contenteditable="true"]',
+      'textarea',
+      'div[contenteditable="true"][role="textbox"]',
+      'div[contenteditable="true"]'
+    ],
+    sendButtonSelectors: [
+      'div.send-button-container',
+      'div.chat-editor-action div.send-button-container',
+      'button[aria-label*="发送"]',
+      'button[aria-label*="Send"]',
+      'button[data-testid*="send"]',
+      'button[class*="send"]',
+      'button[type="submit"]'
+    ]
+  }
+];
 
 let isRunning = false;
 let lastExecutedText = '';
@@ -18,6 +59,44 @@ let lastExecutedAt = 0;
  */
 function logInfo(...args) {
   console.log(CONTENT_LOG_PREFIX, ...args);
+}
+
+/**
+ * Detects current target site adapter from location hostname.
+ * @returns {{id:string,name:string,hostnames:string[],composerSelectors:string[],sendButtonSelectors:string[]} | null}
+ */
+function detectCurrentSiteAdapter() {
+  const hostname = window.location.hostname.toLowerCase();
+
+  for (const adapter of TARGET_SITE_ADAPTERS) {
+    const isMatch = adapter.hostnames.some(
+      (domain) => hostname === domain || hostname.endsWith(`.${domain}`)
+    );
+    if (isMatch) {
+      return adapter;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Gets site adapter by id.
+ * @param {string|undefined} siteId
+ * @returns {{id:string,name:string,hostnames:string[],composerSelectors:string[],sendButtonSelectors:string[]} | null}
+ */
+function getSiteAdapterById(siteId) {
+  if (!siteId || typeof siteId !== 'string') {
+    return null;
+  }
+
+  for (const adapter of TARGET_SITE_ADAPTERS) {
+    if (adapter.id === siteId) {
+      return adapter;
+    }
+  }
+
+  return null;
 }
 
 /**
@@ -81,7 +160,7 @@ function readPromptFromUrl() {
 }
 
 /**
- * Removes the prompt payload from URL to avoid duplicate sending on refresh.
+ * Removes prompt payload from URL to avoid duplicate sending on refresh.
  */
 function clearPromptFromUrl() {
   try {
@@ -102,51 +181,61 @@ function clearPromptFromUrl() {
 }
 
 /**
- * Waits until a ChatGPT composer element is available.
- * Supports textarea and contenteditable composer variants.
+ * Waits until a site-specific composer element is available.
+ * @param {{id:string,name:string,composerSelectors:string[]}} adapter
  * @returns {Promise<HTMLElement>}
  */
-function waitForComposer() {
+function waitForComposer(adapter) {
   return new Promise((resolve, reject) => {
     const startedAt = Date.now();
 
     const timer = setInterval(() => {
-      const composer =
-        document.querySelector('textarea#prompt-textarea') ||
-        document.querySelector('textarea[data-id="root"]') ||
-        document.querySelector('textarea') ||
-        document.querySelector('div[contenteditable="true"][id="prompt-textarea"]') ||
-        document.querySelector('div[contenteditable="true"][role="textbox"]') ||
-        document.querySelector('div[contenteditable="true"]');
-
-      if (composer) {
-        clearInterval(timer);
-        resolve(composer);
-        return;
+      for (const selector of adapter.composerSelectors) {
+        const composer = document.querySelector(selector);
+        if (composer instanceof HTMLElement) {
+          clearInterval(timer);
+          resolve(composer);
+          return;
+        }
       }
 
       if (Date.now() - startedAt > MAX_WAIT_MS) {
         clearInterval(timer);
-        reject(new Error('Timed out waiting for ChatGPT composer'));
+        reject(new Error(`Timed out waiting for ${adapter.name} composer`));
       }
     }, POLL_INTERVAL_MS);
   });
 }
 
 /**
- * Finds a likely send button on ChatGPT page.
- * @returns {HTMLButtonElement|null}
+ * Tries to find send button around composer first, then globally.
+ * @param {{sendButtonSelectors:string[]}} adapter
+ * @param {HTMLElement} composer
+ * @returns {HTMLElement|null}
  */
-function findSendButton() {
-  return (
-    document.querySelector('button[data-testid="send-button"]') ||
-    document.querySelector('button[aria-label*="Send"]') ||
-    document.querySelector('button[aria-label*="发送"]')
-  );
+function findSendButton(adapter, composer) {
+  const parentForm = composer.closest('form');
+  if (parentForm) {
+    for (const selector of adapter.sendButtonSelectors) {
+      const localButton = parentForm.querySelector(selector);
+      if (localButton instanceof HTMLElement) {
+        return localButton;
+      }
+    }
+  }
+
+  for (const selector of adapter.sendButtonSelectors) {
+    const globalButton = document.querySelector(selector);
+    if (globalButton instanceof HTMLElement) {
+      return globalButton;
+    }
+  }
+
+  return null;
 }
 
 /**
- * Fills text into ChatGPT composer and dispatches input event for framework state sync.
+ * Fills text into composer and dispatches input event for framework state sync.
  * @param {HTMLElement} composer
  * @param {string} text
  */
@@ -165,17 +254,22 @@ function fillComposer(composer, text) {
 
 /**
  * Attempts to trigger send action via button click, then Enter key fallback.
+ * @param {{id:string,name:string,sendButtonSelectors:string[]}} adapter
  * @param {HTMLElement} composer
  */
-function triggerSend(composer) {
-  const sendButton = findSendButton();
-  if (sendButton && !sendButton.disabled) {
-    logInfo('Clicking send button.');
+function triggerSend(adapter, composer) {
+  const sendButton = findSendButton(adapter, composer);
+  if (
+    sendButton &&
+    (!(sendButton instanceof HTMLButtonElement) || !sendButton.disabled) &&
+    getComputedStyle(sendButton).pointerEvents !== 'none'
+  ) {
+    logInfo('Clicking send button.', { site: adapter.id });
     sendButton.click();
     return;
   }
 
-  logInfo('Send button unavailable, fallback to Enter key.');
+  logInfo('Send button unavailable, fallback to Enter key.', { site: adapter.id });
   composer.dispatchEvent(
     new KeyboardEvent('keydown', {
       key: 'Enter',
@@ -191,8 +285,9 @@ function triggerSend(composer) {
 /**
  * Runs composer fill + send flow from provided text.
  * @param {string} finalText
+ * @param {string|undefined} preferredSiteId
  */
-async function runWithText(finalText) {
+async function runWithText(finalText, preferredSiteId) {
   if (isRunning) {
     logInfo('Auto-send already in progress, skip new payload.');
     return;
@@ -210,15 +305,21 @@ async function runWithText(finalText) {
       return;
     }
 
+    const adapter = getSiteAdapterById(preferredSiteId) || detectCurrentSiteAdapter();
+    if (!adapter) {
+      console.error('No site adapter matched for current page:', window.location.hostname);
+      return;
+    }
+
     markExecution(finalText);
-    const composer = await waitForComposer();
-    logInfo('Composer ready, writing prompt.', { textLength: finalText.length });
+    const composer = await waitForComposer(adapter);
+    logInfo('Composer ready, writing prompt.', { site: adapter.id, textLength: finalText.length });
     fillComposer(composer, finalText);
 
     // Give UI state a short time to enable send action.
     setTimeout(() => {
       try {
-        triggerSend(composer);
+        triggerSend(adapter, composer);
       } catch (error) {
         console.error('Failed to trigger send action:', error);
       }
@@ -295,7 +396,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return;
   }
 
-  runWithText(message.finalText)
+  const adapterFromMessage = getSiteAdapterById(message.targetSite);
+  if (adapterFromMessage) {
+    logInfo('Received runtime task with target site.', { targetSite: adapterFromMessage.id });
+  }
+
+  runWithText(message.finalText, message.targetSite)
     .then(() => {
       sendResponse({ ok: true });
     })
