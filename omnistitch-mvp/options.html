@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>OmniStitch Prompt 管理</title>
+    <link rel="stylesheet" href="options.css" />
+  </head>
+  <body>
+    <main class="container">
+      <header>
+        <h1>Prompt 管理</h1>
+        <p>管理一键发送时使用的 Prompt 模板。</p>
+      </header>
+
+      <section class="panel">
+        <h2>新增 Prompt</h2>
+        <form id="create-form">
+          <label for="prompt-title">标题</label>
+          <input id="prompt-title" type="text" maxlength="80" required />
+
+          <label for="prompt-content">内容</label>
+          <textarea id="prompt-content" rows="5" required></textarea>
+
+          <button type="submit">新增</button>
+        </form>
+      </section>
+
+      <section class="panel">
+        <h2>已有 Prompt</h2>
+        <p id="status" class="status"></p>
+        <ul id="prompt-list" class="prompt-list"></ul>
+      </section>
+    </main>
+
+    <template id="prompt-item-template">
+      <li class="prompt-item">
+        <div class="item-head">
+          <strong class="item-title"></strong>
+          <span class="badge">当前使用</span>
+        </div>
+        <textarea class="item-content" rows="4"></textarea>
+        <div class="item-actions">
+          <button class="btn-save">保存</button>
+          <button class="btn-activate">设为当前</button>
+          <button class="btn-delete danger">删除</button>
+        </div>
+      </li>
+    </template>
+
+    <script src="options.js"></script>
+  </body>
+</html>

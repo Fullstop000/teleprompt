@@ -1,0 +1,30 @@
+{
+  "manifest_version": 3,
+  "name": "OmniStitch MVP",
+  "version": "0.1.0",
+  "description": "One-click: open ChatGPT and auto-send prompt with current page URL.",
+  "permissions": ["tabs", "storage", "activeTab"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "options_page": "options.html",
+  "action": {
+    "default_title": "Send to ChatGPT"
+  },
+  "commands": {
+    "send-to-chatgpt": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+Y",
+        "mac": "Command+Shift+Y"
+      },
+      "description": "Send active page URL to ChatGPT with the active prompt"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
