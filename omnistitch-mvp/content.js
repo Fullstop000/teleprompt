@@ -1,10 +1,48 @@
 const TASK_PREFIX = 'omnistitch_task_';
 const TASK_PARAM = 'omnistitch_task';
+const PROMPT_PARAM = 'q';
+const LEGACY_PROMPT_PARAM = 'omnistitch_prompt';
 const MESSAGE_ACTION = 'omnistitch_auto_send';
 const MAX_WAIT_MS = 30000;
 const POLL_INTERVAL_MS = 250;
+const DEDUPE_WINDOW_MS = 15000;
+const CONTENT_LOG_PREFIX = '[omnistitch][content]';
 
 let isRunning = false;
+let lastExecutedText = '';
+let lastExecutedAt = 0;
+
+/**
+ * Writes a content-script debug log with a stable prefix.
+ * @param {...unknown} args
+ */
+function logInfo(...args) {
+  console.log(CONTENT_LOG_PREFIX, ...args);
+}
+
+/**
+ * Tracks a just-executed payload for duplicate suppression.
+ * @param {string} text
+ */
+function markExecution(text) {
+  lastExecutedText = text;
+  lastExecutedAt = Date.now();
+}
+
+/**
+ * Checks whether the payload was already executed recently.
+ * @param {string} text
+ * @returns {boolean}
+ */
+function isRecentlyExecuted(text) {
+  if (!text || !lastExecutedText) {
+    return false;
+  }
+
+  const isSameText = text === lastExecutedText;
+  const withinWindow = Date.now() - lastExecutedAt <= DEDUPE_WINDOW_MS;
+  return isSameText && withinWindow;
+}
 
 /**
  * Reads task id from URL query string.
@@ -18,6 +56,48 @@ function readTaskIdFromUrl() {
   } catch (error) {
     console.error('Failed to parse task id from URL:', error);
     return null;
+  }
+}
+
+/**
+ * Reads prompt payload from URL query string.
+ * @returns {string|null}
+ */
+function readPromptFromUrl() {
+  try {
+    const searchParams = new URLSearchParams(window.location.search);
+    const fromQ = searchParams.get(PROMPT_PARAM);
+    const fromLegacy = searchParams.get(LEGACY_PROMPT_PARAM);
+    const prompt = fromQ || fromLegacy;
+    logInfo('Read prompt from URL.', {
+      source: fromQ ? PROMPT_PARAM : fromLegacy ? LEGACY_PROMPT_PARAM : null,
+      promptLength: prompt ? prompt.length : 0
+    });
+    return prompt || null;
+  } catch (error) {
+    console.error('Failed to parse prompt from URL:', error);
+    return null;
+  }
+}
+
+/**
+ * Removes the prompt payload from URL to avoid duplicate sending on refresh.
+ */
+function clearPromptFromUrl() {
+  try {
+    const url = new URL(window.location.href);
+    const hasCurrent = url.searchParams.has(PROMPT_PARAM);
+    const hasLegacy = url.searchParams.has(LEGACY_PROMPT_PARAM);
+    if (!hasCurrent && !hasLegacy) {
+      return;
+    }
+
+    url.searchParams.delete(PROMPT_PARAM);
+    url.searchParams.delete(LEGACY_PROMPT_PARAM);
+    history.replaceState(null, document.title, url.toString());
+    logInfo('Prompt params cleared from URL.');
+  } catch (error) {
+    console.error('Failed to clear prompt from URL:', error);
   }
 }
 
@@ -90,10 +170,12 @@ function fillComposer(composer, text) {
 function triggerSend(composer) {
   const sendButton = findSendButton();
   if (sendButton && !sendButton.disabled) {
+    logInfo('Clicking send button.');
     sendButton.click();
     return;
   }
 
+  logInfo('Send button unavailable, fallback to Enter key.');
   composer.dispatchEvent(
     new KeyboardEvent('keydown', {
       key: 'Enter',
@@ -112,6 +194,7 @@ function triggerSend(composer) {
  */
 async function runWithText(finalText) {
   if (isRunning) {
+    logInfo('Auto-send already in progress, skip new payload.');
     return;
   }
 
@@ -122,7 +205,14 @@ async function runWithText(finalText) {
       return;
     }
 
+    if (isRecentlyExecuted(finalText)) {
+      logInfo('Skip duplicate payload in dedupe window.', { textLength: finalText.length });
+      return;
+    }
+
+    markExecution(finalText);
     const composer = await waitForComposer();
+    logInfo('Composer ready, writing prompt.', { textLength: finalText.length });
     fillComposer(composer, finalText);
 
     // Give UI state a short time to enable send action.
@@ -171,16 +261,54 @@ async function runFromTaskId() {
 }
 
 /**
+ * Primary path: read prompt payload directly from URL query string.
+ */
+async function runFromUrlPrompt() {
+  const prompt = readPromptFromUrl();
+  if (!prompt) {
+    logInfo('No URL prompt payload found.');
+    return;
+  }
+
+  try {
+    logInfo('Starting URL prompt auto-send flow.');
+    await runWithText(prompt);
+    clearPromptFromUrl();
+  } catch (error) {
+    console.error('Failed to execute URL prompt auto-send task:', error);
+  }
+}
+
+/**
  * Primary path: receive payload directly from background service worker.
  */
-chrome.runtime.onMessage.addListener((message) => {
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (!message || message.action !== MESSAGE_ACTION) {
     return;
   }
 
-  runWithText(message.finalText).catch((error) => {
-    console.error('Failed to handle runtime task message:', error);
-  });
+  if (isRecentlyExecuted(message.finalText)) {
+    logInfo('Skip duplicate runtime message payload.', {
+      textLength: message.finalText ? message.finalText.length : 0
+    });
+    sendResponse({ ok: true, skipped: true });
+    return;
+  }
+
+  runWithText(message.finalText)
+    .then(() => {
+      sendResponse({ ok: true });
+    })
+    .catch((error) => {
+      console.error('Failed to handle runtime task message:', error);
+      sendResponse({ ok: false, error: String(error) });
+    });
+
+  return true;
 });
 
-runFromTaskId();
+runFromUrlPrompt()
+  .then(() => runFromTaskId())
+  .catch((error) => {
+    console.error('Failed to bootstrap content auto-send flow:', error);
+  });
