@@ -46,7 +46,9 @@ async function loadPromptStore() {
     return store;
   } catch (error) {
     console.error('Failed to load prompt store:', error);
-    return createDefaultStore();
+    const defaultStore = createDefaultStore();
+    await chrome.storage.local.set({ [PROMPT_STORE_KEY]: defaultStore });
+    return defaultStore;
   }
 }
 
