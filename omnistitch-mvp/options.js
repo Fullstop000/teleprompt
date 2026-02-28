@@ -1,6 +1,12 @@
 const STORAGE_KEY = 'prompt_store_v1';
 const TARGET_STORE_KEY = 'target_site_v1';
-const VALID_TARGET_SITES = ['chatgpt', 'kimi'];
+const VALID_TARGET_SITES = ['chatgpt', 'kimi', 'deepseek', 'gemini'];
+const TARGET_SITE_LABELS = {
+  chatgpt: 'ChatGPT',
+  kimi: 'Kimi',
+  deepseek: 'DeepSeek',
+  gemini: 'Gemini'
+};
 
 /**
  * Generates a unique id for a prompt item.
@@ -30,18 +36,18 @@ function createDefaultStore() {
 
 /**
  * Creates default target settings for jump destination.
- * @returns {{targetSites: Array<'chatgpt'|'kimi'>}}
+ * @returns {{targetSites: Array<'chatgpt'|'kimi'|'deepseek'|'gemini'>}}
  */
 function createDefaultTargetSettings() {
   return {
-    targetSites: ['chatgpt']
+    targetSites: [...VALID_TARGET_SITES]
   };
 }
 
 /**
  * Normalizes target settings and keeps backward compatibility with old single-target schema.
  * @param {{targetSites?: string[], targetSite?: string}|undefined} settings
- * @returns {{targetSites: Array<'chatgpt'|'kimi'>}}
+ * @returns {{targetSites: Array<'chatgpt'|'kimi'|'deepseek'|'gemini'>}}
  */
 function normalizeTargetSettings(settings) {
   const normalizedSet = new Set();
@@ -59,7 +65,9 @@ function normalizeTargetSettings(settings) {
   }
 
   if (normalizedSet.size === 0) {
-    normalizedSet.add('chatgpt');
+    for (const siteId of VALID_TARGET_SITES) {
+      normalizedSet.add(siteId);
+    }
   }
 
   return {
@@ -97,7 +105,7 @@ async function loadStore() {
 
 /**
  * Loads target settings from extension local storage and initializes defaults if missing.
- * @returns {Promise<{targetSites: Array<'chatgpt'|'kimi'>}>}
+ * @returns {Promise<{targetSites: Array<'chatgpt'|'kimi'|'deepseek'|'gemini'>}>}
  */
 async function loadTargetSettings() {
   try {
@@ -138,7 +146,7 @@ async function saveStore(store) {
 
 /**
  * Saves target settings to extension local storage.
- * @param {{targetSites: Array<'chatgpt'|'kimi'>}} settings
+ * @param {{targetSites: Array<'chatgpt'|'kimi'|'deepseek'|'gemini'>}} settings
  * @returns {Promise<void>}
  */
 async function saveTargetSettings(settings) {
@@ -288,7 +296,7 @@ async function init() {
 
     try {
       await saveTargetSettings({ targetSites: selectedValues });
-      const targetLabels = selectedValues.map((site) => (site === 'chatgpt' ? 'ChatGPT' : 'Kimi'));
+      const targetLabels = selectedValues.map((site) => TARGET_SITE_LABELS[site] || site);
       setStatus(`已保存跳转目标：${targetLabels.join('、')}`);
     } catch (error) {
       setStatus('保存跳转目标失败，请重试。');

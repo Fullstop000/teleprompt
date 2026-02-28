@@ -18,6 +18,18 @@ const TARGET_SITE_CONFIGS = {
     name: 'Kimi',
     baseUrl: 'https://www.kimi.com/',
     promptParam: null
+  },
+  deepseek: {
+    id: 'deepseek',
+    name: 'DeepSeek',
+    baseUrl: 'https://chat.deepseek.com/',
+    promptParam: null
+  },
+  gemini: {
+    id: 'gemini',
+    name: 'Gemini',
+    baseUrl: 'https://gemini.google.com/app',
+    promptParam: null
   }
 };
 
@@ -72,7 +84,7 @@ function createDefaultStore() {
  */
 function createDefaultTargetSettings() {
   return {
-    targetSites: [DEFAULT_TARGET_SITE]
+    targetSites: ['chatgpt', 'kimi', 'deepseek', 'gemini']
   };
 }
 
@@ -97,7 +109,9 @@ function normalizeTargetSettings(settings) {
   }
 
   if (normalizedSet.size === 0) {
-    normalizedSet.add(DEFAULT_TARGET_SITE);
+    for (const siteId of Object.keys(TARGET_SITE_CONFIGS)) {
+      normalizedSet.add(siteId);
+    }
   }
 
   return {

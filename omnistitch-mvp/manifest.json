@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "OmniStitch MVP",
   "version": "0.1.0",
-  "description": "One-click: jump to ChatGPT or Kimi and auto-send prompt with current page URL.",
+  "description": "One-click: jump to ChatGPT/Kimi/DeepSeek/Gemini and auto-send prompt with current page URL.",
   "permissions": [
     "tabs",
     "storage",
@@ -30,7 +30,9 @@
         "https://chatgpt.com/*",
         "https://chat.openai.com/*",
         "https://www.kimi.com/*",
-        "https://kimi.com/*"
+        "https://kimi.com/*",
+        "https://chat.deepseek.com/*",
+        "https://gemini.google.com/*"
       ],
       "js": [
         "content.js"

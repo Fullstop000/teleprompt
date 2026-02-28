@@ -46,6 +46,59 @@ const TARGET_SITE_ADAPTERS = [
       'button[class*="send"]',
       'button[type="submit"]'
     ]
+  },
+  {
+    id: 'deepseek',
+    name: 'DeepSeek',
+    hostnames: ['chat.deepseek.com'],
+    composerSelectors: [
+      'textarea[placeholder*="给 DeepSeek 发送消息"]',
+      'textarea#chat-input',
+      'div#chat-input[contenteditable="true"]',
+      'textarea[placeholder*="DeepSeek"]',
+      'textarea',
+      'div[contenteditable="true"][role="textbox"]',
+      'div[contenteditable="true"]'
+    ],
+    sendButtonSelectors: [
+      'div[role="button"]._7436101[aria-disabled="false"]',
+      'div[role="button"]._7436101:not(.ds-icon-button--disabled)',
+      'button#send-message-button',
+      'button[aria-label*="Send"]',
+      'button[aria-label*="发送"]',
+      'button[data-testid*="send"]',
+      'button[class*="send"]',
+      'button[type="submit"]',
+      'div[class*="send"]'
+    ]
+  },
+  {
+    id: 'gemini',
+    name: 'Gemini',
+    hostnames: ['gemini.google.com'],
+    composerSelectors: [
+      'div.ql-editor.textarea[contenteditable="true"]',
+      'rich-textarea div[contenteditable="true"]',
+      'div.input-area div[contenteditable="true"]',
+      'textarea[aria-label*="Enter a prompt"]',
+      'div[role="textbox"][aria-label*="Gemini"]',
+      'textarea[placeholder*="prompt"]',
+      'textarea',
+      'div[contenteditable="true"][role="textbox"]',
+      'div[contenteditable="true"]'
+    ],
+    sendButtonSelectors: [
+      'button.send-button',
+      'button[aria-label="发送"]',
+      'button[aria-label*="Send message"]',
+      'button[aria-label*="Send"]',
+      'button[aria-label*="发送"]',
+      'button[data-test-id*="send"]',
+      'button[data-testid*="send"]',
+      'button[class*="send"]',
+      'button[type="submit"]',
+      'div[class*="send"]'
+    ]
   }
 ];
 
