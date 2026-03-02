@@ -6,6 +6,7 @@
 - 自动填入“当前 Prompt + 当前页面 URL”。
 - 自动点击发送。
 - 支持 Prompt 管理（新增/编辑/删除/设为当前）。
+- 支持将 AI 回复自动同步到“同步目标”系统（可切换 provider：关闭 / Webhook / Notion）。
 
 ## 安装
 1. 打开 `chrome://extensions/`。
@@ -14,22 +15,30 @@
 4. 选择目录：`omnistitch-mvp`。
 
 ## 使用
-1. 在扩展详情页点击 `Extension options`，先配置 Prompt（可选）。  
+1. 在扩展详情页点击 `Extension options`，先配置 Prompt（可选）。
    默认内置一个“博客总结” Prompt。
-2. 打开任意 `http/https` 博客页面。
-3. 点击扩展图标 `OmniStitch MVP`。
-4. 等待自动跳转所选目标站点并发送。
+2. 在 `Extension options` 的“同步目标”区域选择 provider：
+   - `关闭同步`：只发送，不外部同步。
+   - `Webhook`：将结果 POST 到你的 webhook URL。
+   - `Notion`：写入 Notion 数据库。
+3. 打开任意 `http/https` 博客页面。
+4. 点击扩展图标 `OmniStitch MVP`。
+5. 等待自动跳转所选目标站点并发送。
+
+## Sync 字段说明
+- 扩展内部统一采集字段：
+  - `taskid`
+  - `target`
+  - `time`
+  - `aiResponse`
+  - `sourceUrl`
+- Notion provider 要求数据库存在字段：`AI回复`、`target`、`时间`、`taskid`。
 
 ## Prompt 管理
 1. 打开 `chrome://extensions/`。
 2. 找到 `OmniStitch MVP` 并点击 `Details`。
 3. 点击 `Extension options` 进入管理页。
 4. 可进行新增、编辑内容、删除、设为当前操作。
-
-## 旧版使用（兼容）
-1. 打开任意 `http/https` 博客页面。
-2. 点击扩展图标 `OmniStitch MVP`。
-3. 等待自动跳转所选目标站点并发送。
 
 ## 已知限制
 - 需保证你已登录所选目标站点（ChatGPT/Kimi/DeepSeek/Gemini）。
@@ -41,15 +50,15 @@
   - Windows/Linux: `Ctrl+Shift+Y`
 - 修改快捷键：
   1. 打开浏览器扩展快捷键页面（Chrome/Arc 都支持）。
-  2. 找到 `OmniStitch MVP` 的 `Send active page URL to ChatGPT with the active prompt`。
+  2. 找到 `OmniStitch MVP` 的 `Send active page URL to configured AI target`。
   3. 自定义为你习惯的组合键。
 
 ## 故障排查
 - 点击扩展只跳转不发送：
-  1. 先在 `arc://extensions` 点 `Reload` 扩展。
+  1. 在扩展页点击 `Reload` 扩展。
   2. 确认目标站点已登录并且页面可正常手动发送。
   3. 打开扩展的 `service worker` 控制台和目标站点页控制台查看错误日志。
-- 快捷键无效（Arc 常见）：
-  1. 打开 `arc://extensions/shortcuts`。
-  2. 给 `OmniStitch MVP` 的命令手动绑定一个快捷键（避免和系统快捷键冲突）。
-  3. 将快捷键作用域设为 `In Arc` 或 `Global`（按你的使用习惯）。
+- 同步未生效：
+  1. 先确认“同步目标”配置已保存。
+  2. Webhook 模式下检查 URL 可达与服务端返回状态码。
+  3. Notion 模式下确认 token/database 权限和字段名。

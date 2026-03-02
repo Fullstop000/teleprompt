@@ -11,7 +11,7 @@
     <main class="ui-container ui-stack">
       <header class="hero">
         <h1 class="hero-title">OmniStitch 控制台</h1>
-        <p class="hero-subtitle">管理跳转目标与 Prompt 模板，让一键发送更稳定。</p>
+        <p class="hero-subtitle">管理跳转目标、Prompt 与同步目标，让一键发送更稳定。</p>
       </header>
 
       <section class="ui-card ui-section ui-stack">
@@ -40,6 +40,63 @@
           </div>
           <div class="target-action">
             <button class="ui-btn ui-btn-primary" type="submit">保存目标设置</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="ui-card ui-section ui-stack">
+        <h2>同步目标</h2>
+        <form id="sync-form" class="ui-grid">
+          <div>
+            <label class="ui-label" for="sync-provider">同步目标类型</label>
+            <select class="ui-input" id="sync-provider">
+              <option value="disabled">关闭同步</option>
+              <option value="webhook">Webhook</option>
+              <option value="notion">Notion</option>
+            </select>
+          </div>
+
+          <div id="sync-webhook-fields" class="sync-provider-fields ui-grid">
+            <div>
+              <label class="ui-label" for="sync-webhook-url">Webhook URL</label>
+              <input class="ui-input" id="sync-webhook-url" type="url" placeholder="https://example.com/hooks/ai-response" />
+            </div>
+            <div>
+              <label class="ui-label" for="sync-webhook-auth-token">Webhook Bearer Token（可选）</label>
+              <input class="ui-input" id="sync-webhook-auth-token" type="password" autocomplete="off" />
+            </div>
+          </div>
+
+          <div id="sync-notion-fields" class="sync-provider-fields ui-grid">
+            <div>
+              <label class="ui-label" for="sync-notion-token">Notion Integration Token</label>
+              <input class="ui-input" id="sync-notion-token" type="password" placeholder="secret_xxx" autocomplete="off" />
+            </div>
+            <div>
+              <label class="ui-label" for="sync-notion-database-id">Notion Database ID</label>
+              <input
+                class="ui-input"
+                id="sync-notion-database-id"
+                type="text"
+                placeholder="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+              />
+            </div>
+            <p class="notion-hint">Notion 数据库需包含字段：AI回复、target、时间、taskid。</p>
+          </div>
+
+          <div class="sync-switches">
+            <label class="switch-item">
+              <input id="sync-auto-sync" type="checkbox" />
+              <span>自动同步（默认开启）</span>
+            </label>
+            <label class="switch-item">
+              <input id="sync-retry-enabled" type="checkbox" />
+              <span>失败重试（默认开启）</span>
+            </label>
+          </div>
+
+          <div>
+            <button class="ui-btn ui-btn-primary" type="submit">保存同步配置</button>
           </div>
         </form>
       </section>
