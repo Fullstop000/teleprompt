@@ -6,7 +6,7 @@
 - 自动填入“当前 Prompt + 当前页面 URL”。
 - 自动点击发送。
 - 支持 Prompt 管理（新增/编辑/删除/设为当前）。
-- 支持将 AI 回复自动同步到“同步目标”系统（可切换 provider：关闭 / Webhook / Notion）。
+- 支持将 AI 回复自动同步到“同步目标”系统（可切换 provider：关闭 / Webhook / Notion / Obsidian）。
 
 ## 安装
 1. 打开 `chrome://extensions/`。
@@ -21,6 +21,7 @@
    - `关闭同步`：只发送，不外部同步。
    - `Webhook`：将结果 POST 到你的 webhook URL。
    - `Notion`：写入 Notion 数据库。
+   - `Obsidian`：通过 Obsidian Local REST API 写入周期笔记。
 3. 打开任意 `http/https` 博客页面。
 4. 点击扩展图标 `OmniStitch MVP`。
 5. 等待自动跳转所选目标站点并发送。
@@ -33,6 +34,7 @@
   - `aiResponse`
   - `sourceUrl`
 - Notion provider 要求数据库存在字段：`AI回复`、`target`、`时间`、`taskid`。
+- Obsidian provider 为每条 AI 回复创建一个新 note（`PUT /vault/{filename}`），默认写入 `Daily/OmniStitch/YYYY-MM-DD/{article-title}/{target}/`。
 
 ## Prompt 管理
 1. 打开 `chrome://extensions/`。
@@ -62,3 +64,4 @@
   1. 先确认“同步目标”配置已保存。
   2. Webhook 模式下检查 URL 可达与服务端返回状态码。
   3. Notion 模式下确认 token/database 权限和字段名。
+  4. Obsidian 模式下确认 Local REST API 插件已开启，Base URL/API Key 正确。

@@ -11,7 +11,8 @@ const TARGET_SITE_LABELS = {
 const SYNC_PROVIDER_IDS = {
   DISABLED: 'disabled',
   NOTION: 'notion',
-  WEBHOOK: 'webhook'
+  WEBHOOK: 'webhook',
+  OBSIDIAN: 'obsidian'
 };
 
 /**
@@ -52,7 +53,7 @@ function createDefaultTargetSettings() {
 
 /**
  * Creates default sync-target settings.
- * @returns {{provider:string,autoSync:boolean,retryEnabled:boolean,notionToken:string,notionDatabaseId:string,webhookUrl:string,webhookAuthToken:string}}
+ * @returns {{provider:string,autoSync:boolean,retryEnabled:boolean,notionToken:string,notionDatabaseId:string,webhookUrl:string,webhookAuthToken:string,obsidianBaseUrl:string,obsidianApiKey:string}}
  */
 function createDefaultSyncTargetSettings() {
   return {
@@ -62,7 +63,9 @@ function createDefaultSyncTargetSettings() {
     notionToken: '',
     notionDatabaseId: '',
     webhookUrl: '',
-    webhookAuthToken: ''
+    webhookAuthToken: '',
+    obsidianBaseUrl: 'https://127.0.0.1:27124',
+    obsidianApiKey: ''
   };
 }
 
@@ -75,7 +78,8 @@ function isValidProvider(provider) {
   return (
     provider === SYNC_PROVIDER_IDS.DISABLED ||
     provider === SYNC_PROVIDER_IDS.NOTION ||
-    provider === SYNC_PROVIDER_IDS.WEBHOOK
+    provider === SYNC_PROVIDER_IDS.WEBHOOK ||
+    provider === SYNC_PROVIDER_IDS.OBSIDIAN
   );
 }
 
@@ -113,7 +117,7 @@ function normalizeTargetSettings(settings) {
 /**
  * Normalizes sync-target settings using current schema only.
  * @param {Record<string, unknown>|undefined} settings
- * @returns {{provider:string,autoSync:boolean,retryEnabled:boolean,notionToken:string,notionDatabaseId:string,webhookUrl:string,webhookAuthToken:string}}
+ * @returns {{provider:string,autoSync:boolean,retryEnabled:boolean,notionToken:string,notionDatabaseId:string,webhookUrl:string,webhookAuthToken:string,obsidianBaseUrl:string,obsidianApiKey:string}}
  */
 function normalizeSyncTargetSettings(settings) {
   const defaults = createDefaultSyncTargetSettings();
@@ -127,6 +131,10 @@ function normalizeSyncTargetSettings(settings) {
   const webhookUrl = typeof data.webhookUrl === 'string' ? data.webhookUrl.trim() : defaults.webhookUrl;
   const webhookAuthToken =
     typeof data.webhookAuthToken === 'string' ? data.webhookAuthToken.trim() : defaults.webhookAuthToken;
+  const obsidianBaseUrl =
+    typeof data.obsidianBaseUrl === 'string' ? data.obsidianBaseUrl.trim() : defaults.obsidianBaseUrl;
+  const obsidianApiKey =
+    typeof data.obsidianApiKey === 'string' ? data.obsidianApiKey.trim() : defaults.obsidianApiKey;
   const autoSync = typeof data.autoSync === 'boolean' ? data.autoSync : defaults.autoSync;
   const retryEnabled = typeof data.retryEnabled === 'boolean' ? data.retryEnabled : defaults.retryEnabled;
 
@@ -139,7 +147,9 @@ function normalizeSyncTargetSettings(settings) {
     notionToken,
     notionDatabaseId,
     webhookUrl,
-    webhookAuthToken
+    webhookAuthToken,
+    obsidianBaseUrl,
+    obsidianApiKey
   };
 }
 
@@ -201,7 +211,7 @@ async function loadTargetSettings() {
 
 /**
  * Loads sync-target settings from extension local storage.
- * @returns {Promise<{provider:string,autoSync:boolean,retryEnabled:boolean,notionToken:string,notionDatabaseId:string,webhookUrl:string,webhookAuthToken:string}>}
+ * @returns {Promise<{provider:string,autoSync:boolean,retryEnabled:boolean,notionToken:string,notionDatabaseId:string,webhookUrl:string,webhookAuthToken:string,obsidianBaseUrl:string,obsidianApiKey:string}>}
  */
 async function loadSyncTargetSettings() {
   try {
@@ -216,7 +226,9 @@ async function loadSyncTargetSettings() {
       raw.notionToken === normalized.notionToken &&
       raw.notionDatabaseId === normalized.notionDatabaseId &&
       raw.webhookUrl === normalized.webhookUrl &&
-      raw.webhookAuthToken === normalized.webhookAuthToken;
+      raw.webhookAuthToken === normalized.webhookAuthToken &&
+      raw.obsidianBaseUrl === normalized.obsidianBaseUrl &&
+      raw.obsidianApiKey === normalized.obsidianApiKey;
 
     if (!hasSameShape) {
       await chrome.storage.local.set({ [SYNC_TARGET_SETTINGS_KEY]: normalized });
@@ -261,7 +273,7 @@ async function saveTargetSettings(settings) {
 
 /**
  * Saves sync-target settings to extension local storage.
- * @param {{provider:string,autoSync:boolean,retryEnabled:boolean,notionToken:string,notionDatabaseId:string,webhookUrl:string,webhookAuthToken:string}} settings
+ * @param {{provider:string,autoSync:boolean,retryEnabled:boolean,notionToken:string,notionDatabaseId:string,webhookUrl:string,webhookAuthToken:string,obsidianBaseUrl:string,obsidianApiKey:string}} settings
  * @returns {Promise<void>}
  */
 async function saveSyncTargetSettings(settings) {
@@ -278,10 +290,12 @@ async function saveSyncTargetSettings(settings) {
  * @param {string} provider
  * @param {HTMLElement} notionFields
  * @param {HTMLElement} webhookFields
+ * @param {HTMLElement} obsidianFields
  */
-function renderSyncProviderFields(provider, notionFields, webhookFields) {
+function renderSyncProviderFields(provider, notionFields, webhookFields, obsidianFields) {
   notionFields.hidden = provider !== SYNC_PROVIDER_IDS.NOTION;
   webhookFields.hidden = provider !== SYNC_PROVIDER_IDS.WEBHOOK;
+  obsidianFields.hidden = provider !== SYNC_PROVIDER_IDS.OBSIDIAN;
 }
 
 /**
@@ -399,9 +413,12 @@ async function init() {
   const syncRetryEnabledInput = document.getElementById('sync-retry-enabled');
   const syncWebhookUrlInput = document.getElementById('sync-webhook-url');
   const syncWebhookAuthTokenInput = document.getElementById('sync-webhook-auth-token');
+  const syncObsidianBaseUrlInput = document.getElementById('sync-obsidian-base-url');
+  const syncObsidianApiKeyInput = document.getElementById('sync-obsidian-api-key');
   const syncNotionTokenInput = document.getElementById('sync-notion-token');
   const syncNotionDatabaseIdInput = document.getElementById('sync-notion-database-id');
   const syncWebhookFields = document.getElementById('sync-webhook-fields');
+  const syncObsidianFields = document.getElementById('sync-obsidian-fields');
   const syncNotionFields = document.getElementById('sync-notion-fields');
   const form = document.getElementById('create-form');
   const titleInput = document.getElementById('prompt-title');
@@ -416,9 +433,12 @@ async function init() {
     !(syncRetryEnabledInput instanceof HTMLInputElement) ||
     !(syncWebhookUrlInput instanceof HTMLInputElement) ||
     !(syncWebhookAuthTokenInput instanceof HTMLInputElement) ||
+    !(syncObsidianBaseUrlInput instanceof HTMLInputElement) ||
+    !(syncObsidianApiKeyInput instanceof HTMLInputElement) ||
     !(syncNotionTokenInput instanceof HTMLInputElement) ||
     !(syncNotionDatabaseIdInput instanceof HTMLInputElement) ||
     !(syncWebhookFields instanceof HTMLElement) ||
+    !(syncObsidianFields instanceof HTMLElement) ||
     !(syncNotionFields instanceof HTMLElement) ||
     !form ||
     !titleInput ||
@@ -441,12 +461,14 @@ async function init() {
   syncRetryEnabledInput.checked = syncSettings.retryEnabled;
   syncWebhookUrlInput.value = syncSettings.webhookUrl;
   syncWebhookAuthTokenInput.value = syncSettings.webhookAuthToken;
+  syncObsidianBaseUrlInput.value = syncSettings.obsidianBaseUrl;
+  syncObsidianApiKeyInput.value = syncSettings.obsidianApiKey;
   syncNotionTokenInput.value = syncSettings.notionToken;
   syncNotionDatabaseIdInput.value = syncSettings.notionDatabaseId;
-  renderSyncProviderFields(syncProviderSelect.value, syncNotionFields, syncWebhookFields);
+  renderSyncProviderFields(syncProviderSelect.value, syncNotionFields, syncWebhookFields, syncObsidianFields);
 
   syncProviderSelect.addEventListener('change', () => {
-    renderSyncProviderFields(syncProviderSelect.value, syncNotionFields, syncWebhookFields);
+    renderSyncProviderFields(syncProviderSelect.value, syncNotionFields, syncWebhookFields, syncObsidianFields);
   });
 
   targetForm.addEventListener('submit', async (event) => {
@@ -481,6 +503,8 @@ async function init() {
     const notionDatabaseId = syncNotionDatabaseIdInput.value.trim();
     const webhookUrl = syncWebhookUrlInput.value.trim();
     const webhookAuthToken = syncWebhookAuthTokenInput.value.trim();
+    const obsidianBaseUrl = syncObsidianBaseUrlInput.value.trim();
+    const obsidianApiKey = syncObsidianApiKeyInput.value.trim();
     const autoSync = syncAutoSyncInput.checked;
     const retryEnabled = syncRetryEnabledInput.checked;
 
@@ -507,6 +531,24 @@ async function init() {
       }
     }
 
+    if (provider === SYNC_PROVIDER_IDS.OBSIDIAN) {
+      if (!obsidianBaseUrl || !obsidianApiKey) {
+        setStatus('使用 Obsidian 同步时，请填写 API Base URL 与 API Key。');
+        return;
+      }
+
+      try {
+        const parsed = new URL(obsidianBaseUrl);
+        if (!/^https?:$/i.test(parsed.protocol)) {
+          setStatus('Obsidian Base URL 仅支持 http/https 协议。');
+          return;
+        }
+      } catch (error) {
+        setStatus('Obsidian Base URL 格式不正确。');
+        return;
+      }
+    }
+
     try {
       const normalized = normalizeSyncTargetSettings({
         provider,
@@ -515,7 +557,9 @@ async function init() {
         notionToken,
         notionDatabaseId,
         webhookUrl,
-        webhookAuthToken
+        webhookAuthToken,
+        obsidianBaseUrl,
+        obsidianApiKey
       });
       await saveSyncTargetSettings(normalized);
       setStatus('已保存同步目标配置。');

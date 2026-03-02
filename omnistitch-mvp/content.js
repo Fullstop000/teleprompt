@@ -1,6 +1,8 @@
 const TASK_PREFIX = 'omnistitch_task_';
 const TASK_PARAM = 'omnistitch_task';
 const PROMPT_PARAM = 'q';
+const SOURCE_URL_PARAM = 'omnistitch_source';
+const SOURCE_TITLE_PARAM = 'omnistitch_title';
 const MESSAGE_ACTION = 'omnistitch_auto_send';
 const AI_RESPONSE_REPORT_ACTION = 'omnistitch_ai_response_report';
 const MAX_WAIT_MS = 30000;
@@ -10,6 +12,7 @@ const RESPONSE_CAPTURE_TIMEOUT_MS = 180000;
 const RESPONSE_CAPTURE_POLL_MS = 1000;
 const RESPONSE_STABLE_ROUNDS = 3;
 const MIN_RESPONSE_TEXT_LENGTH = 20;
+const RESPONSE_LOG_PREVIEW_LENGTH = 120;
 const CONTENT_LOG_PREFIX = '[omnistitch][content]';
 const GENERIC_RESPONSE_SELECTORS = [
   '[data-message-author-role="assistant"]',
@@ -253,6 +256,34 @@ function readTaskIdFromUrl() {
 }
 
 /**
+ * Reads source article URL from URL query string.
+ * @returns {string}
+ */
+function readSourceUrlFromUrl() {
+  try {
+    const searchParams = new URLSearchParams(window.location.search);
+    return (searchParams.get(SOURCE_URL_PARAM) || '').trim();
+  } catch (error) {
+    console.error('Failed to parse source url from URL:', error);
+    return '';
+  }
+}
+
+/**
+ * Reads source article title from URL query string.
+ * @returns {string}
+ */
+function readSourceTitleFromUrl() {
+  try {
+    const searchParams = new URLSearchParams(window.location.search);
+    return (searchParams.get(SOURCE_TITLE_PARAM) || '').trim();
+  } catch (error) {
+    console.error('Failed to parse source title from URL:', error);
+    return '';
+  }
+}
+
+/**
  * Reads prompt payload from URL query string.
  * @returns {string|null}
  */
@@ -279,12 +310,16 @@ function clearPromptFromUrl() {
     const url = new URL(window.location.href);
     const hasCurrent = url.searchParams.has(PROMPT_PARAM);
     const hasTask = url.searchParams.has(TASK_PARAM);
-    if (!hasCurrent && !hasTask) {
+    const hasSourceUrl = url.searchParams.has(SOURCE_URL_PARAM);
+    const hasSourceTitle = url.searchParams.has(SOURCE_TITLE_PARAM);
+    if (!hasCurrent && !hasTask && !hasSourceUrl && !hasSourceTitle) {
       return;
     }
 
     url.searchParams.delete(PROMPT_PARAM);
     url.searchParams.delete(TASK_PARAM);
+    url.searchParams.delete(SOURCE_URL_PARAM);
+    url.searchParams.delete(SOURCE_TITLE_PARAM);
     history.replaceState(null, document.title, url.toString());
     logInfo('Prompt/task params cleared from URL.');
   } catch (error) {
@@ -397,8 +432,8 @@ function triggerSend(adapter, composer) {
 /**
  * Resolves task context from runtime payload and URL fallback.
  * @param {{id:string}} adapter
- * @param {{taskId?: string, sourceUrl?: string}|undefined} incomingTaskContext
- * @returns {{taskId: string, targetSite: string, sourceUrl: string}}
+ * @param {{taskId?: string, sourceUrl?: string, sourceTitle?: string}|undefined} incomingTaskContext
+ * @returns {{taskId: string, targetSite: string, sourceUrl: string, sourceTitle: string}}
  */
 function resolveTaskContext(adapter, incomingTaskContext) {
   const taskIdFromMessage =
@@ -411,11 +446,16 @@ function resolveTaskContext(adapter, incomingTaskContext) {
     incomingTaskContext && typeof incomingTaskContext.sourceUrl === 'string' && incomingTaskContext.sourceUrl
       ? incomingTaskContext.sourceUrl
       : '';
+  const sourceTitle =
+    incomingTaskContext && typeof incomingTaskContext.sourceTitle === 'string' && incomingTaskContext.sourceTitle
+      ? incomingTaskContext.sourceTitle
+      : '';
 
   return {
     taskId,
     targetSite: adapter.id,
-    sourceUrl
+    sourceUrl,
+    sourceTitle
   };
 }
 
@@ -430,6 +470,20 @@ function normalizeCapturedText(text) {
     .replace(/\n{3,}/g, '\n\n')
     .replace(/[ \t]{2,}/g, ' ')
     .trim();
+}
+
+/**
+ * Builds a short one-line preview for debug logs.
+ * @param {string} text
+ * @returns {string}
+ */
+function buildTextPreview(text) {
+  const normalized = normalizeCapturedText(text).replace(/\n/g, '\\n');
+  if (normalized.length <= RESPONSE_LOG_PREVIEW_LENGTH) {
+    return normalized;
+  }
+
+  return `${normalized.slice(0, RESPONSE_LOG_PREVIEW_LENGTH)}...`;
 }
 
 /**
@@ -494,9 +548,19 @@ function waitForStableAssistantResponse(adapter, baselineResponses) {
     const startedAt = Date.now();
     let lastCandidate = '';
     let stableRounds = 0;
+    let pollRounds = 0;
+
+    logInfo('Assistant response capture started.', {
+      site: adapter.id,
+      baselineCount: baselineResponses.size,
+      timeoutMs: RESPONSE_CAPTURE_TIMEOUT_MS,
+      pollIntervalMs: RESPONSE_CAPTURE_POLL_MS,
+      stableRoundsRequired: RESPONSE_STABLE_ROUNDS
+    });
 
     const timer = setInterval(() => {
       try {
+        pollRounds += 1;
         const currentResponses = collectAssistantResponseTexts(adapter);
         const candidate = pickLatestFreshResponse(currentResponses, baselineResponses);
 
@@ -506,21 +570,62 @@ function waitForStableAssistantResponse(adapter, baselineResponses) {
           } else {
             lastCandidate = candidate;
             stableRounds = 1;
+            logInfo('Assistant response candidate detected.', {
+              site: adapter.id,
+              pollRounds,
+              currentResponseCount: currentResponses.length,
+              candidateLength: candidate.length,
+              candidatePreview: buildTextPreview(candidate)
+            });
           }
+
+          logInfo('Assistant response candidate stability progress.', {
+            site: adapter.id,
+            pollRounds,
+            stableRounds,
+            stableRoundsRequired: RESPONSE_STABLE_ROUNDS,
+            candidateLength: candidate.length
+          });
 
           if (stableRounds >= RESPONSE_STABLE_ROUNDS) {
             clearInterval(timer);
+            logInfo('Assistant response stabilized.', {
+              site: adapter.id,
+              pollRounds,
+              stableRounds,
+              responseLength: candidate.length,
+              responsePreview: buildTextPreview(candidate)
+            });
             resolve(candidate);
             return;
           }
+        } else if (pollRounds % 10 === 0) {
+          logInfo('Assistant response capture polling heartbeat.', {
+            site: adapter.id,
+            pollRounds,
+            currentResponseCount: currentResponses.length,
+            baselineCount: baselineResponses.size
+          });
         }
 
         if (Date.now() - startedAt > RESPONSE_CAPTURE_TIMEOUT_MS) {
           clearInterval(timer);
+          console.error('Assistant response capture timed out.', {
+            site: adapter.id,
+            pollRounds,
+            baselineCount: baselineResponses.size,
+            lastCandidateLength: lastCandidate.length,
+            lastCandidatePreview: buildTextPreview(lastCandidate)
+          });
           reject(new Error(`Timed out waiting for assistant response on ${adapter.id}`));
         }
       } catch (error) {
         clearInterval(timer);
+        console.error('Assistant response capture polling failed.', {
+          site: adapter.id,
+          pollRounds,
+          error: String(error)
+        });
         reject(error);
       }
     }, RESPONSE_CAPTURE_POLL_MS);
@@ -528,35 +633,68 @@ function waitForStableAssistantResponse(adapter, baselineResponses) {
 }
 
 /**
- * Reports one captured assistant response back to background for Notion syncing.
- * @param {{taskId: string, targetSite: string, sourceUrl: string}} taskContext
+ * Reports one captured assistant response back to background for provider syncing.
+ * @param {{taskId: string, targetSite: string, sourceUrl: string, sourceTitle: string}} taskContext
  * @param {string} responseText
  */
 async function reportAssistantResponse(taskContext, responseText) {
   if (!taskContext.taskId || !responseText) {
+    logInfo('Skip assistant response report due to invalid payload.', {
+      taskId: taskContext.taskId || null,
+      hasResponse: Boolean(responseText)
+    });
     return;
   }
 
-  await sendRuntimeMessage({
+  const payload = {
     action: AI_RESPONSE_REPORT_ACTION,
     taskId: taskContext.taskId,
     targetSite: taskContext.targetSite,
     sourceUrl: taskContext.sourceUrl,
+    sourceTitle: taskContext.sourceTitle,
     aiResponse: responseText,
     capturedAt: new Date().toISOString()
+  };
+
+  logInfo('Reporting assistant response to background.', {
+    taskId: taskContext.taskId,
+    targetSite: taskContext.targetSite,
+    sourceUrl: taskContext.sourceUrl || null,
+    sourceTitle: taskContext.sourceTitle || null,
+    responseLength: responseText.length,
+    responsePreview: buildTextPreview(responseText)
+  });
+
+  const reportResult = await sendRuntimeMessage(payload);
+  logInfo('Assistant response report acknowledged by background.', {
+    taskId: taskContext.taskId,
+    targetSite: taskContext.targetSite,
+    result: reportResult || null
   });
 }
 
 /**
  * Starts async response capture and report pipeline for one dispatched task.
  * @param {{id:string,responseSelectors:string[]}} adapter
- * @param {{taskId: string, targetSite: string, sourceUrl: string}} taskContext
+ * @param {{taskId: string, targetSite: string, sourceUrl: string, sourceTitle: string}} taskContext
  * @param {Set<string>} baselineResponses
  */
 function startAssistantResponseCapture(adapter, taskContext, baselineResponses) {
   if (!taskContext.taskId || reportingTaskIds.has(taskContext.taskId) || reportedTaskIds.has(taskContext.taskId)) {
+    logInfo('Skip assistant response capture bootstrap.', {
+      site: adapter.id,
+      taskId: taskContext.taskId || null,
+      alreadyReporting: taskContext.taskId ? reportingTaskIds.has(taskContext.taskId) : false,
+      alreadyReported: taskContext.taskId ? reportedTaskIds.has(taskContext.taskId) : false
+    });
     return;
   }
+
+  logInfo('Assistant response capture pipeline bootstrapped.', {
+    site: adapter.id,
+    taskId: taskContext.taskId,
+    baselineCount: baselineResponses.size
+  });
 
   reportingTaskIds.add(taskContext.taskId);
   waitForStableAssistantResponse(adapter, baselineResponses)
@@ -581,7 +719,7 @@ function startAssistantResponseCapture(adapter, taskContext, baselineResponses) 
  * Runs composer fill + send flow from provided text.
  * @param {string} finalText
  * @param {string|undefined} preferredSiteId
- * @param {{taskId?: string, sourceUrl?: string}|undefined} incomingTaskContext
+ * @param {{taskId?: string, sourceUrl?: string, sourceTitle?: string}|undefined} incomingTaskContext
  */
 async function runWithText(finalText, preferredSiteId, incomingTaskContext) {
   if (isRunning) {
@@ -658,7 +796,8 @@ async function runFromTaskId() {
 
     await runWithText(task.finalText, task.targetSite, {
       taskId: task.taskId || taskId,
-      sourceUrl: task.sourceUrl || ''
+      sourceUrl: task.sourceUrl || '',
+      sourceTitle: task.sourceTitle || ''
     });
     await chrome.storage.local.remove(storageKey);
   } catch (error) {
@@ -678,8 +817,14 @@ async function runFromUrlPrompt() {
 
   try {
     const taskId = readTaskIdFromUrl() || undefined;
-    logInfo('Starting URL prompt auto-send flow.', { taskId: taskId || null });
-    await runWithText(prompt, undefined, { taskId });
+    const sourceUrl = readSourceUrlFromUrl();
+    const sourceTitle = readSourceTitleFromUrl();
+    logInfo('Starting URL prompt auto-send flow.', {
+      taskId: taskId || null,
+      sourceUrl: sourceUrl || null,
+      sourceTitle: sourceTitle || null
+    });
+    await runWithText(prompt, undefined, { taskId, sourceUrl, sourceTitle });
     clearPromptFromUrl();
   } catch (error) {
     console.error('Failed to execute URL prompt auto-send task:', error);
@@ -713,7 +858,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   runWithText(message.finalText, message.targetSite, {
     taskId: message.taskId,
-    sourceUrl: message.sourceUrl
+    sourceUrl: message.sourceUrl,
+    sourceTitle: message.sourceTitle
   })
     .then(() => {
       sendResponse({ ok: true });

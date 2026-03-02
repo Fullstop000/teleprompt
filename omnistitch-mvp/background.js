@@ -8,6 +8,11 @@ try {
 } catch (error) {
   console.error('Failed to load webhook provider script:', error);
 }
+try {
+  importScripts('obsidian-provider.js');
+} catch (error) {
+  console.error('Failed to load obsidian provider script:', error);
+}
 
 const PROMPT_STORE_KEY = 'prompt_store_v1';
 const TARGET_STORE_KEY = 'target_site_v1';
@@ -18,6 +23,8 @@ const AI_RESPONSE_REPORT_ACTION = 'omnistitch_ai_response_report';
 const DEFAULT_TARGET_SITE = 'chatgpt';
 const PROMPT_PARAM = 'q';
 const TASK_PARAM = 'omnistitch_task';
+const SOURCE_URL_PARAM = 'omnistitch_source';
+const SOURCE_TITLE_PARAM = 'omnistitch_title';
 const MESSAGE_RETRY_LIMIT = 8;
 const MESSAGE_RETRY_DELAY_MS = 600;
 const SYNC_RETRY_ALARM_NAME = 'omnistitch_sync_retry_alarm';
@@ -27,7 +34,8 @@ const BG_LOG_PREFIX = '[omnistitch][bg]';
 const SYNC_PROVIDER_IDS = {
   DISABLED: 'disabled',
   NOTION: 'notion',
-  WEBHOOK: 'webhook'
+  WEBHOOK: 'webhook',
+  OBSIDIAN: 'obsidian'
 };
 const TARGET_SITE_CONFIGS = {
   chatgpt: {
@@ -114,7 +122,7 @@ function createDefaultTargetSettings() {
 /**
  * Creates the default sync-target settings.
  * disabled means capture is enabled but no external sync provider is active.
- * @returns {{provider:string,autoSync:boolean,retryEnabled:boolean,notionToken:string,notionDatabaseId:string,webhookUrl:string,webhookAuthToken:string}}
+ * @returns {{provider:string,autoSync:boolean,retryEnabled:boolean,notionToken:string,notionDatabaseId:string,webhookUrl:string,webhookAuthToken:string,obsidianBaseUrl:string,obsidianApiKey:string}}
  */
 function createDefaultSyncTargetSettings() {
   return {
@@ -124,7 +132,9 @@ function createDefaultSyncTargetSettings() {
     notionToken: '',
     notionDatabaseId: '',
     webhookUrl: '',
-    webhookAuthToken: ''
+    webhookAuthToken: '',
+    obsidianBaseUrl: 'https://127.0.0.1:27124',
+    obsidianApiKey: ''
   };
 }
 
@@ -137,7 +147,8 @@ function isValidProvider(provider) {
   return (
     provider === SYNC_PROVIDER_IDS.DISABLED ||
     provider === SYNC_PROVIDER_IDS.NOTION ||
-    provider === SYNC_PROVIDER_IDS.WEBHOOK
+    provider === SYNC_PROVIDER_IDS.WEBHOOK ||
+    provider === SYNC_PROVIDER_IDS.OBSIDIAN
   );
 }
 
@@ -175,7 +186,7 @@ function normalizeTargetSettings(settings) {
 /**
  * Normalizes sync-target settings using current schema only.
  * @param {Record<string, unknown>|undefined} settings
- * @returns {{provider:string,autoSync:boolean,retryEnabled:boolean,notionToken:string,notionDatabaseId:string,webhookUrl:string,webhookAuthToken:string}}
+ * @returns {{provider:string,autoSync:boolean,retryEnabled:boolean,notionToken:string,notionDatabaseId:string,webhookUrl:string,webhookAuthToken:string,obsidianBaseUrl:string,obsidianApiKey:string}}
  */
 function normalizeSyncTargetSettings(settings) {
   const defaults = createDefaultSyncTargetSettings();
@@ -189,6 +200,10 @@ function normalizeSyncTargetSettings(settings) {
   const webhookUrl = typeof data.webhookUrl === 'string' ? data.webhookUrl.trim() : defaults.webhookUrl;
   const webhookAuthToken =
     typeof data.webhookAuthToken === 'string' ? data.webhookAuthToken.trim() : defaults.webhookAuthToken;
+  const obsidianBaseUrl =
+    typeof data.obsidianBaseUrl === 'string' ? data.obsidianBaseUrl.trim() : defaults.obsidianBaseUrl;
+  const obsidianApiKey =
+    typeof data.obsidianApiKey === 'string' ? data.obsidianApiKey.trim() : defaults.obsidianApiKey;
   const autoSync = typeof data.autoSync === 'boolean' ? data.autoSync : defaults.autoSync;
   const retryEnabled = typeof data.retryEnabled === 'boolean' ? data.retryEnabled : defaults.retryEnabled;
 
@@ -201,7 +216,9 @@ function normalizeSyncTargetSettings(settings) {
     notionToken,
     notionDatabaseId,
     webhookUrl,
-    webhookAuthToken
+    webhookAuthToken,
+    obsidianBaseUrl,
+    obsidianApiKey
   };
 }
 
@@ -265,7 +282,7 @@ async function loadTargetSettings() {
 
 /**
  * Loads sync-target settings from current schema.
- * @returns {Promise<{provider:string,autoSync:boolean,retryEnabled:boolean,notionToken:string,notionDatabaseId:string,webhookUrl:string,webhookAuthToken:string}>}
+ * @returns {Promise<{provider:string,autoSync:boolean,retryEnabled:boolean,notionToken:string,notionDatabaseId:string,webhookUrl:string,webhookAuthToken:string,obsidianBaseUrl:string,obsidianApiKey:string}>}
  */
 async function loadSyncTargetSettings() {
   try {
@@ -280,7 +297,9 @@ async function loadSyncTargetSettings() {
       raw.notionToken === normalized.notionToken &&
       raw.notionDatabaseId === normalized.notionDatabaseId &&
       raw.webhookUrl === normalized.webhookUrl &&
-      raw.webhookAuthToken === normalized.webhookAuthToken;
+      raw.webhookAuthToken === normalized.webhookAuthToken &&
+      raw.obsidianBaseUrl === normalized.obsidianBaseUrl &&
+      raw.obsidianApiKey === normalized.obsidianApiKey;
 
     if (!hasSameShape) {
       await chrome.storage.local.set({ [SYNC_TARGET_SETTINGS_KEY]: normalized });
@@ -297,7 +316,7 @@ async function loadSyncTargetSettings() {
 
 /**
  * Loads retry queue from current schema key.
- * @returns {Promise<Array<{id:string,payload:{taskId:string,targetSite:string,sourceUrl:string,aiResponse:string,capturedAt:string},providerId:string,attempts:number,lastError:string,updatedAt:string}>>}
+ * @returns {Promise<Array<{id:string,payload:{taskId:string,targetSite:string,sourceUrl:string,sourceTitle:string,aiResponse:string,capturedAt:string},providerId:string,attempts:number,lastError:string,updatedAt:string}>>}
  */
 async function loadSyncRetryQueue() {
   try {
@@ -315,7 +334,7 @@ async function loadSyncRetryQueue() {
 
 /**
  * Saves sync retry queue into extension storage.
- * @param {Array<{id:string,payload:{taskId:string,targetSite:string,sourceUrl:string,aiResponse:string,capturedAt:string},providerId:string,attempts:number,lastError:string,updatedAt:string}>} queue
+ * @param {Array<{id:string,payload:{taskId:string,targetSite:string,sourceUrl:string,sourceTitle:string,aiResponse:string,capturedAt:string},providerId:string,attempts:number,lastError:string,updatedAt:string}>} queue
  */
 async function saveSyncRetryQueue(queue) {
   try {
@@ -410,6 +429,16 @@ function buildTargetUrl(targetConfig, finalText, taskContext) {
       url.searchParams.set(TASK_PARAM, taskContext.taskId);
     }
 
+    if (taskContext && typeof taskContext.sourceUrl === 'string' && taskContext.sourceUrl) {
+      url.searchParams.set(SOURCE_URL_PARAM, taskContext.sourceUrl);
+    }
+
+    if (taskContext && typeof taskContext.sourceTitle === 'string' && taskContext.sourceTitle) {
+      // Keep title query payload bounded to reduce URL explosion risk.
+      const safeTitle = taskContext.sourceTitle.slice(0, 300);
+      url.searchParams.set(SOURCE_TITLE_PARAM, safeTitle);
+    }
+
     return url.toString();
   } catch (error) {
     console.error('Failed to build target URL with prompt payload:', error);
@@ -432,7 +461,7 @@ function resolveActiveProvider(settings) {
 
 /**
  * Checks whether selected sync provider has required credentials.
- * @param {{notionToken:string,notionDatabaseId:string,webhookUrl:string}} settings
+ * @param {{notionToken:string,notionDatabaseId:string,webhookUrl:string,obsidianBaseUrl:string,obsidianApiKey:string}} settings
  * @param {string} providerId
  * @returns {boolean}
  */
@@ -447,6 +476,10 @@ function hasProviderCredentials(settings, providerId) {
 
   if (providerId === SYNC_PROVIDER_IDS.WEBHOOK) {
     return Boolean(settings.webhookUrl);
+  }
+
+  if (providerId === SYNC_PROVIDER_IDS.OBSIDIAN) {
+    return Boolean(settings.obsidianBaseUrl && settings.obsidianApiKey);
   }
 
   return false;
@@ -466,13 +499,17 @@ function buildProviderCredentialError(providerId) {
     return 'Webhook URL is not configured.';
   }
 
+  if (providerId === SYNC_PROVIDER_IDS.OBSIDIAN) {
+    return 'Obsidian baseUrl/apiKey is not configured.';
+  }
+
   return 'Sync provider is not configured.';
 }
 
 /**
  * Normalizes one AI response report payload before syncing.
- * @param {{taskId?: string, targetSite?: string, sourceUrl?: string, aiResponse?: string, capturedAt?: string}} message
- * @returns {{taskId: string, targetSite: string, sourceUrl: string, aiResponse: string, capturedAt: string}}
+ * @param {{taskId?: string, targetSite?: string, sourceUrl?: string, sourceTitle?: string, aiResponse?: string, capturedAt?: string}} message
+ * @returns {{taskId: string, targetSite: string, sourceUrl: string, sourceTitle: string, aiResponse: string, capturedAt: string}}
  */
 function normalizeAiResponsePayload(message) {
   const taskId = typeof message.taskId === 'string' ? message.taskId.trim() : '';
@@ -483,6 +520,7 @@ function normalizeAiResponsePayload(message) {
   const targetSite =
     typeof message.targetSite === 'string' && message.targetSite.trim() ? message.targetSite.trim() : 'unknown';
   const sourceUrl = typeof message.sourceUrl === 'string' ? message.sourceUrl.trim() : '';
+  const sourceTitle = typeof message.sourceTitle === 'string' ? message.sourceTitle.trim() : '';
   const aiResponse = typeof message.aiResponse === 'string' ? message.aiResponse.trim() : '';
   if (!aiResponse) {
     throw new Error('AI response content is empty.');
@@ -495,6 +533,7 @@ function normalizeAiResponsePayload(message) {
     taskId,
     targetSite,
     sourceUrl,
+    sourceTitle,
     aiResponse,
     capturedAt
   };
@@ -527,9 +566,22 @@ function getWebhookProvider() {
 }
 
 /**
+ * Reads Obsidian provider API from service worker global scope.
+ * @returns {{sync: Function}}
+ */
+function getObsidianProvider() {
+  const provider = self.OmnistitchObsidianProvider;
+  if (!provider || typeof provider.sync !== 'function') {
+    throw new Error('Obsidian provider is unavailable.');
+  }
+
+  return provider;
+}
+
+/**
  * Dispatches sync payload to active provider implementation.
- * @param {{taskId: string, targetSite: string, sourceUrl: string, aiResponse: string, capturedAt: string}} payload
- * @param {{provider:string,notionToken:string,notionDatabaseId:string,webhookUrl:string,webhookAuthToken:string}} settings
+ * @param {{taskId: string, targetSite: string, sourceUrl: string, sourceTitle: string, aiResponse: string, capturedAt: string}} payload
+ * @param {{provider:string,notionToken:string,notionDatabaseId:string,webhookUrl:string,webhookAuthToken:string,obsidianBaseUrl:string,obsidianApiKey:string}} settings
  * @param {string} providerId
  */
 async function syncPayloadToProvider(payload, settings, providerId) {
@@ -545,6 +597,12 @@ async function syncPayloadToProvider(payload, settings, providerId) {
     return;
   }
 
+  if (providerId === SYNC_PROVIDER_IDS.OBSIDIAN) {
+    const obsidianProvider = getObsidianProvider();
+    await obsidianProvider.sync(payload, settings);
+    return;
+  }
+
   if (providerId === SYNC_PROVIDER_IDS.DISABLED) {
     return;
   }
@@ -554,22 +612,30 @@ async function syncPayloadToProvider(payload, settings, providerId) {
 
 /**
  * Adds one failed payload into local retry queue.
- * @param {{taskId: string, targetSite: string, sourceUrl: string, aiResponse: string, capturedAt: string}} payload
+ * @param {{taskId: string, targetSite: string, sourceUrl: string, sourceTitle: string, aiResponse: string, capturedAt: string}} payload
  * @param {string} providerId
  * @param {string} lastError
  */
 async function enqueueSyncRetry(payload, providerId, lastError) {
   const queue = await loadSyncRetryQueue();
-  queue.push({
+  const retryItem = {
     id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
     payload,
     providerId,
     attempts: 0,
     lastError,
     updatedAt: new Date().toISOString()
-  });
+  };
+  queue.push(retryItem);
 
   await saveSyncRetryQueue(queue);
+  logInfo('Sync retry item enqueued.', {
+    retryId: retryItem.id,
+    taskId: payload.taskId,
+    providerId,
+    queueSize: queue.length,
+    lastError
+  });
   await scheduleSyncRetryAlarm();
 }
 
@@ -654,7 +720,7 @@ async function retryQueuedSync() {
 
 /**
  * Handles one AI response report from content scripts.
- * @param {{taskId?: string, targetSite?: string, sourceUrl?: string, aiResponse?: string, capturedAt?: string}} message
+ * @param {{taskId?: string, targetSite?: string, sourceUrl?: string, sourceTitle?: string, aiResponse?: string, capturedAt?: string}} message
  * @returns {Promise<{ok: boolean, queued?: boolean, skipped?: boolean, error?: string}>}
  */
 async function handleAiResponseReport(message) {
@@ -662,14 +728,39 @@ async function handleAiResponseReport(message) {
   const syncSettings = await loadSyncTargetSettings();
   const providerId = resolveActiveProvider(syncSettings);
 
+  logInfo('AI response report received.', {
+    taskId: payload.taskId,
+    targetSite: payload.targetSite,
+    providerId,
+    autoSync: syncSettings.autoSync,
+    retryEnabled: syncSettings.retryEnabled,
+    responseLength: payload.aiResponse.length,
+    sourceUrl: payload.sourceUrl || null,
+    sourceTitle: payload.sourceTitle || null
+  });
+
   if (!syncSettings.autoSync || providerId === SYNC_PROVIDER_IDS.DISABLED) {
+    logInfo('AI response sync skipped by settings.', {
+      taskId: payload.taskId,
+      providerId,
+      autoSync: syncSettings.autoSync
+    });
     return { ok: true, skipped: true };
   }
 
   if (!hasProviderCredentials(syncSettings, providerId)) {
     const error = buildProviderCredentialError(providerId);
+    console.error('AI response sync blocked by missing provider credentials.', {
+      taskId: payload.taskId,
+      providerId,
+      error
+    });
     if (syncSettings.retryEnabled) {
       await enqueueSyncRetry(payload, providerId, error);
+      logInfo('AI response queued due to missing provider credentials.', {
+        taskId: payload.taskId,
+        providerId
+      });
       return { ok: true, queued: true };
     }
 
@@ -678,11 +769,21 @@ async function handleAiResponseReport(message) {
 
   try {
     await syncPayloadToProvider(payload, syncSettings, providerId);
+    logInfo('AI response sync completed.', {
+      taskId: payload.taskId,
+      providerId,
+      targetSite: payload.targetSite
+    });
     return { ok: true };
   } catch (error) {
     console.error('Failed to sync AI response:', error);
     if (syncSettings.retryEnabled) {
       await enqueueSyncRetry(payload, providerId, String(error));
+      logInfo('AI response queued after sync failure.', {
+        taskId: payload.taskId,
+        providerId,
+        error: String(error)
+      });
       return { ok: true, queued: true };
     }
 
@@ -696,7 +797,7 @@ async function handleAiResponseReport(message) {
  * @param {number} tabId
  * @param {string} targetSite
  * @param {string} finalText
- * @param {{taskId: string, sourceUrl: string}} taskContext
+ * @param {{taskId: string, sourceUrl: string, sourceTitle: string}} taskContext
  * @param {number} retry
  */
 function sendTaskMessageToTab(tabId, targetSite, finalText, taskContext, retry = 0) {
@@ -714,7 +815,8 @@ function sendTaskMessageToTab(tabId, targetSite, finalText, taskContext, retry =
       targetSite,
       finalText,
       taskId: taskContext.taskId,
-      sourceUrl: taskContext.sourceUrl
+      sourceUrl: taskContext.sourceUrl,
+      sourceTitle: taskContext.sourceTitle
     },
     (response) => {
       const err = chrome.runtime.lastError;
@@ -741,7 +843,7 @@ function sendTaskMessageToTab(tabId, targetSite, finalText, taskContext, retry =
  * @param {string} targetName
  * @param {number} tabId
  * @param {string} finalText
- * @param {{taskId: string, sourceUrl: string}} taskContext
+ * @param {{taskId: string, sourceUrl: string, sourceTitle: string}} taskContext
  */
 function attachTaskDeliveryListener(targetSite, targetName, tabId, finalText, taskContext) {
   const handleTabUpdated = (updatedTabId, changeInfo) => {
@@ -766,7 +868,7 @@ function attachTaskDeliveryListener(targetSite, targetName, tabId, finalText, ta
  * Opens target site and schedules task delivery by runtime message.
  * @param {{id: string, name: string, baseUrl: string, promptParam: string|null}} targetConfig
  * @param {string} finalText
- * @param {{taskId: string, sourceUrl: string}} taskContext
+ * @param {{taskId: string, sourceUrl: string, sourceTitle: string}} taskContext
  */
 async function openTargetAndDispatchTask(targetConfig, finalText, taskContext) {
   const targetUrl = buildTargetUrl(targetConfig, finalText, taskContext);
@@ -802,6 +904,8 @@ async function openTargetAndDispatchTask(targetConfig, finalText, taskContext) {
 async function runSendFlow(tab) {
   try {
     const currentUrl = tab?.url;
+    const rawTitle = typeof tab?.title === 'string' ? tab.title.trim() : '';
+    const sourceTitle = rawTitle || currentUrl || '';
     logInfo('Read active tab URL.', { currentUrl: currentUrl || null });
     if (!currentUrl || !/^https?:\/\//.test(currentUrl)) {
       console.error('Unsupported or empty URL:', currentUrl);
@@ -820,7 +924,8 @@ async function runSendFlow(tab) {
       targetConfigs.map((targetConfig) => {
         const taskContext = {
           taskId: generateTaskId(targetConfig.id),
-          sourceUrl: currentUrl
+          sourceUrl: currentUrl,
+          sourceTitle
         };
         return openTargetAndDispatchTask(targetConfig, finalText, taskContext);
       })

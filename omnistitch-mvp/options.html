@@ -53,6 +53,7 @@
               <option value="disabled">关闭同步</option>
               <option value="webhook">Webhook</option>
               <option value="notion">Notion</option>
+              <option value="obsidian">Obsidian Local REST API</option>
             </select>
           </div>
 
@@ -82,6 +83,20 @@
               />
             </div>
             <p class="notion-hint">Notion 数据库需包含字段：AI回复、target、时间、taskid。</p>
+          </div>
+
+          <div id="sync-obsidian-fields" class="sync-provider-fields ui-grid">
+            <div>
+              <label class="ui-label" for="sync-obsidian-base-url">Obsidian API Base URL</label>
+              <input class="ui-input" id="sync-obsidian-base-url" type="url" placeholder="https://127.0.0.1:27124" />
+            </div>
+            <div>
+              <label class="ui-label" for="sync-obsidian-api-key">Obsidian API Key</label>
+              <input class="ui-input" id="sync-obsidian-api-key" type="password" autocomplete="off" />
+            </div>
+            <p class="sync-provider-hint">
+              每条 AI 回复会创建为一个新 note，路径在 <code>Daily/OmniStitch/YYYY-MM-DD/{article-title}/{target}/</code> 下。
+            </p>
           </div>
 
           <div class="sync-switches">
