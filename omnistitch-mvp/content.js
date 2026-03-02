@@ -9,17 +9,23 @@ const MAX_WAIT_MS = 30000;
 const POLL_INTERVAL_MS = 250;
 const DEDUPE_WINDOW_MS = 15000;
 const RESPONSE_CAPTURE_TIMEOUT_MS = 180000;
-const RESPONSE_CAPTURE_POLL_MS = 1000;
-const RESPONSE_STABLE_ROUNDS = 3;
 const MIN_RESPONSE_TEXT_LENGTH = 20;
-const RESPONSE_LOG_PREVIEW_LENGTH = 120;
+const RESPONSE_LOG_PREVIEW_LENGTH = 100;
+const CAPTURE_ACK_TIMEOUT_MS = 2000;
+const CAPTURE_HARD_TIMEOUT_MS = 185000;
+const CAPTURE_MAIN_EVENT_SOURCE = 'omnistitch_capture_main';
+const CAPTURE_CONTENT_EVENT_SOURCE = 'omnistitch_capture_content';
+const CAPTURE_EVENT_TYPES = {
+  START: 'OMNISTITCH_CAPTURE_START',
+  STOP: 'OMNISTITCH_CAPTURE_STOP',
+  READY: 'OMNISTITCH_CAPTURE_READY',
+  ACK: 'OMNISTITCH_CAPTURE_ACK',
+  CHUNK: 'OMNISTITCH_CAPTURE_CHUNK',
+  STREAM_END: 'OMNISTITCH_CAPTURE_STREAM_END',
+  FINAL: 'OMNISTITCH_CAPTURE_FINAL',
+  ERROR: 'OMNISTITCH_CAPTURE_ERROR'
+};
 const CONTENT_LOG_PREFIX = '[omnistitch][content]';
-const GENERIC_RESPONSE_SELECTORS = [
-  '[data-message-author-role="assistant"]',
-  'div[class*="assistant-message"]',
-  'div[class*="model-response"]',
-  'div[class*="markdown"]'
-];
 const TARGET_SITE_ADAPTERS = [
   {
     id: 'chatgpt',
@@ -38,11 +44,6 @@ const TARGET_SITE_ADAPTERS = [
       'button[aria-label*="Send"]',
       'button[aria-label*="发送"]',
       'button[type="submit"]'
-    ],
-    responseSelectors: [
-      'div[data-message-author-role="assistant"]',
-      'article [data-message-author-role="assistant"]',
-      'main [data-message-author-role="assistant"]'
     ]
   },
   {
@@ -63,8 +64,7 @@ const TARGET_SITE_ADAPTERS = [
       'button[data-testid*="send"]',
       'button[class*="send"]',
       'button[type="submit"]'
-    ],
-    responseSelectors: ['div.markdown___vuBDJ', 'div[class*="assistant"] div[class*="markdown"]', 'div.segment-content']
+    ]
   },
   {
     id: 'deepseek',
@@ -89,8 +89,7 @@ const TARGET_SITE_ADAPTERS = [
       'button[class*="send"]',
       'button[type="submit"]',
       'div[class*="send"]'
-    ],
-    responseSelectors: ['div.ds-markdown', 'div[class*="assistant"] div.markdown', 'div.markdown']
+    ]
   },
   {
     id: 'gemini',
@@ -118,8 +117,7 @@ const TARGET_SITE_ADAPTERS = [
       'button[class*="send"]',
       'button[type="submit"]',
       'div[class*="send"]'
-    ],
-    responseSelectors: ['message-content .markdown', 'div.model-response-text', 'div[class*="response-content"]']
+    ]
   }
 ];
 
@@ -127,8 +125,8 @@ let isRunning = false;
 let lastExecutedText = '';
 let lastExecutedTaskId = '';
 let lastExecutedAt = 0;
-const reportingTaskIds = new Set();
-const reportedTaskIds = new Set();
+const networkCaptureSessions = new Map();
+let captureBridgeInitialized = false;
 
 /**
  * Writes a content-script debug log with a stable prefix.
@@ -170,7 +168,7 @@ async function sendRuntimeMessage(payload) {
 
 /**
  * Detects current target site adapter from location hostname.
- * @returns {{id:string,name:string,hostnames:string[],composerSelectors:string[],sendButtonSelectors:string[],responseSelectors:string[]} | null}
+ * @returns {{id:string,name:string,hostnames:string[],composerSelectors:string[],sendButtonSelectors:string[]} | null}
  */
 function detectCurrentSiteAdapter() {
   const hostname = window.location.hostname.toLowerCase();
@@ -190,7 +188,7 @@ function detectCurrentSiteAdapter() {
 /**
  * Gets site adapter by id.
  * @param {string|undefined} siteId
- * @returns {{id:string,name:string,hostnames:string[],composerSelectors:string[],sendButtonSelectors:string[],responseSelectors:string[]} | null}
+ * @returns {{id:string,name:string,hostnames:string[],composerSelectors:string[],sendButtonSelectors:string[]} | null}
  */
 function getSiteAdapterById(siteId) {
   if (!siteId || typeof siteId !== 'string') {
@@ -487,148 +485,463 @@ function buildTextPreview(text) {
 }
 
 /**
- * Collects assistant response texts from the current page by selector strategy.
- * @param {{responseSelectors:string[]}} adapter
- * @returns {string[]}
+ * Prints one explicit response preview line for easier console filtering.
+ * @param {string} stage
+ * @param {string} text
  */
-function collectAssistantResponseTexts(adapter) {
-  const selectors = [...adapter.responseSelectors, ...GENERIC_RESPONSE_SELECTORS];
-  const texts = [];
-  const seen = new Set();
+function logResponsePreview(stage, text) {
+  const preview = buildTextPreview(text);
+  console.log(CONTENT_LOG_PREFIX, `[response_preview_100][${stage}]`, preview);
+}
 
-  for (const selector of selectors) {
-    let nodes;
-    try {
-      nodes = document.querySelectorAll(selector);
-    } catch (error) {
+const CAPTURE_TEXT_FIELD_HINTS = [
+  'content',
+  'text',
+  'delta',
+  'answer',
+  'response',
+  'message',
+  'completion',
+  'output'
+];
+const CAPTURE_TEXT_IGNORE_HINTS = ['role', 'id', 'model', 'type', 'index', 'finish_reason', 'token', 'created'];
+
+/**
+ * Checks whether one JSON field path is likely to contain assistant text.
+ * @param {string} path
+ * @returns {boolean}
+ */
+function shouldCollectJsonTextField(path) {
+  const lowerPath = path.toLowerCase();
+  if (!CAPTURE_TEXT_FIELD_HINTS.some((hint) => lowerPath.includes(hint))) {
+    return false;
+  }
+
+  return !CAPTURE_TEXT_IGNORE_HINTS.some((hint) => lowerPath.endsWith(hint) || lowerPath.includes(`.${hint}.`));
+}
+
+/**
+ * Collects likely assistant text fragments from parsed JSON payload.
+ * @param {unknown} value
+ * @param {string} path
+ * @param {string[]} output
+ * @param {number} depth
+ */
+function collectJsonTextFragments(value, path, output, depth = 0) {
+  if (depth > 10 || value === null || value === undefined) {
+    return;
+  }
+
+  if (typeof value === 'string') {
+    if (path && shouldCollectJsonTextField(path) && value.trim()) {
+      output.push(value);
+    }
+    return;
+  }
+
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index += 1) {
+      collectJsonTextFragments(value[index], path ? `${path}[${index}]` : `[${index}]`, output, depth + 1);
+    }
+    return;
+  }
+
+  if (typeof value === 'object') {
+    for (const [key, child] of Object.entries(value)) {
+      collectJsonTextFragments(child, path ? `${path}.${key}` : key, output, depth + 1);
+    }
+  }
+}
+
+/**
+ * Extracts readable response text from raw network capture stream.
+ * @param {string} rawText
+ * @returns {string}
+ */
+function extractReadableTextFromCapture(rawText) {
+  const raw = String(rawText || '').replace(/\r/g, '');
+  if (!raw.trim()) {
+    return '';
+  }
+
+  const fragments = [];
+  const lines = raw.split('\n');
+  for (const rawLine of lines) {
+    let line = rawLine.trim();
+    if (!line) {
       continue;
     }
 
-    for (const node of nodes) {
-      if (!(node instanceof HTMLElement)) {
-        continue;
-      }
-
-      const normalized = normalizeCapturedText(node.innerText || node.textContent || '');
-      if (!normalized || normalized.length < MIN_RESPONSE_TEXT_LENGTH || seen.has(normalized)) {
-        continue;
-      }
-
-      seen.add(normalized);
-      texts.push(normalized);
+    if (line.startsWith('data:')) {
+      line = line.slice(5).trim();
     }
+    if (!line || line === '[DONE]' || line === '[done]') {
+      continue;
+    }
+
+    if (line.startsWith('{') || line.startsWith('[')) {
+      try {
+        const parsed = JSON.parse(line);
+        const chunkTexts = [];
+        collectJsonTextFragments(parsed, '', chunkTexts);
+        if (chunkTexts.length > 0) {
+          fragments.push(chunkTexts.join(''));
+        }
+      } catch (_error) {
+        // Ignore malformed JSON lines, final fallback will use raw stream text.
+      }
+      continue;
+    }
+
+    fragments.push(line);
   }
 
-  return texts;
+  const structuredText = normalizeCapturedText(fragments.join('\n'));
+  if (structuredText.length >= MIN_RESPONSE_TEXT_LENGTH) {
+    return structuredText;
+  }
+
+  const regexExtractedFragments = [];
+  const jsonTextFieldPattern =
+    /"(?:content|text|delta|answer|response|completion|output|output_text|message)"\s*:\s*"((?:\\.|[^"\\])*)"/g;
+  let match = jsonTextFieldPattern.exec(raw);
+  while (match) {
+    try {
+      const decoded = JSON.parse(`"${match[1]}"`);
+      if (decoded && String(decoded).trim()) {
+        regexExtractedFragments.push(String(decoded));
+      }
+    } catch (_error) {
+      // Ignore malformed escaped fragments.
+    }
+    match = jsonTextFieldPattern.exec(raw);
+  }
+
+  const regexExtractedText = normalizeCapturedText(regexExtractedFragments.join('\n'));
+  if (regexExtractedText.length >= MIN_RESPONSE_TEXT_LENGTH) {
+    return regexExtractedText;
+  }
+
+  return normalizeCapturedText(raw);
 }
 
 /**
- * Picks latest response candidate that was not in baseline snapshot.
- * @param {string[]} currentResponses
- * @param {Set<string>} baselineResponses
- * @returns {string|null}
+ * Posts one network-capture control event to page main world.
+ * @param {string} type
+ * @param {Record<string, unknown>} payload
  */
-function pickLatestFreshResponse(currentResponses, baselineResponses) {
-  const freshResponses = currentResponses.filter((item) => !baselineResponses.has(item));
-  if (freshResponses.length > 0) {
-    return freshResponses[freshResponses.length - 1];
-  }
-
-  return null;
+function postCaptureControlEvent(type, payload) {
+  window.postMessage(
+    {
+      source: CAPTURE_CONTENT_EVENT_SOURCE,
+      type,
+      payload
+    },
+    '*'
+  );
 }
 
 /**
- * Waits until one fresh assistant response becomes stable across several polls.
- * @param {{id:string,responseSelectors:string[]}} adapter
- * @param {Set<string>} baselineResponses
- * @returns {Promise<string>}
+ * Clears all timers for one network capture session.
+ * @param {{ackTimer:number|null,hardTimer:number|null}} session
  */
-function waitForStableAssistantResponse(adapter, baselineResponses) {
+function clearNetworkCaptureSessionTimers(session) {
+  if (session.ackTimer !== null) {
+    clearTimeout(session.ackTimer);
+    session.ackTimer = null;
+  }
+
+  if (session.hardTimer !== null) {
+    clearTimeout(session.hardTimer);
+    session.hardTimer = null;
+  }
+}
+
+/**
+ * Cleans one network capture session and notifies main world to stop if needed.
+ * @param {string} taskId
+ * @param {string} reason
+ */
+function cleanupNetworkCaptureSession(taskId, reason) {
+  const session = networkCaptureSessions.get(taskId);
+  if (!session) {
+    return;
+  }
+
+  clearNetworkCaptureSessionTimers(session);
+  networkCaptureSessions.delete(taskId);
+
+  try {
+    postCaptureControlEvent(CAPTURE_EVENT_TYPES.STOP, { taskId, reason });
+  } catch (error) {
+    console.error('Failed to post capture stop event:', error);
+  }
+}
+
+/**
+ * Rejects one network capture session with contextual diagnostics.
+ * @param {string} taskId
+ * @param {Error|string} error
+ * @param {Record<string, unknown>|undefined} extra
+ */
+function failNetworkCaptureSession(taskId, error, extra) {
+  const session = networkCaptureSessions.get(taskId);
+  if (!session || session.completed) {
+    return;
+  }
+
+  session.completed = true;
+  const normalizedError = error instanceof Error ? error : new Error(String(error));
+  console.error('Network capture session failed.', {
+    taskId,
+    targetSite: session.targetSite,
+    acked: session.acked,
+    chunkCount: session.chunkCount,
+    error: normalizedError.message,
+    ...(extra || {})
+  });
+
+  session.reject(normalizedError);
+  cleanupNetworkCaptureSession(taskId, 'failed');
+}
+
+/**
+ * Finalizes one successful network capture session and resolves normalized text.
+ * @param {string} taskId
+ * @param {{reason?: string, captureChannel?: string, captureSourceUrl?: string, chunkCount?: number, durationMs?: number}|undefined} finalPayload
+ */
+function finalizeNetworkCaptureSession(taskId, finalPayload) {
+  const session = networkCaptureSessions.get(taskId);
+  if (!session || session.completed) {
+    return;
+  }
+
+  const responseText = extractReadableTextFromCapture(session.chunks.join(''));
+  if (responseText.length < MIN_RESPONSE_TEXT_LENGTH) {
+    failNetworkCaptureSession(taskId, 'Captured response text is too short.', {
+      reason: finalPayload?.reason || null,
+      responseLength: responseText.length
+    });
+    return;
+  }
+
+  session.completed = true;
+  const captureMeta = {
+    captureMethod: 'network-intercept',
+    captureChannel: finalPayload?.captureChannel || session.captureChannel || 'unknown',
+    captureSourceUrl: finalPayload?.captureSourceUrl || session.captureSourceUrl || '',
+    captureChunkCount:
+      Number.isFinite(finalPayload?.chunkCount) && finalPayload?.chunkCount > 0
+        ? Number(finalPayload.chunkCount)
+        : session.chunkCount,
+    captureDurationMs:
+      Number.isFinite(finalPayload?.durationMs) && finalPayload?.durationMs > 0
+        ? Number(finalPayload.durationMs)
+        : Date.now() - session.startedAt
+  };
+
+  logInfo('Network capture finalized.', {
+    taskId,
+    targetSite: session.targetSite,
+    reason: finalPayload?.reason || null,
+    chunkCount: captureMeta.captureChunkCount,
+    responseLength: responseText.length,
+    captureChannel: captureMeta.captureChannel,
+    captureSourceUrl: captureMeta.captureSourceUrl || null,
+    durationMs: captureMeta.captureDurationMs
+  });
+  logResponsePreview('stabilized', responseText);
+
+  session.resolve({
+    responseText,
+    captureMeta
+  });
+  cleanupNetworkCaptureSession(taskId, 'finalized');
+}
+
+/**
+ * Handles one postMessage event from main world response-capture script.
+ * @param {MessageEvent} event
+ */
+function handleMainCaptureEvent(event) {
+  if (event.source !== window) {
+    return;
+  }
+
+  const data = event.data;
+  if (!data || typeof data !== 'object' || data.source !== CAPTURE_MAIN_EVENT_SOURCE) {
+    return;
+  }
+
+  const type = typeof data.type === 'string' ? data.type : '';
+  const payload = data.payload && typeof data.payload === 'object' ? data.payload : {};
+  const taskId = typeof payload.taskId === 'string' ? payload.taskId : '';
+
+  if (type === CAPTURE_EVENT_TYPES.READY) {
+    logInfo('Main-world capture script is ready.');
+    return;
+  }
+
+  if (!taskId) {
+    return;
+  }
+
+  const session = networkCaptureSessions.get(taskId);
+  if (!session) {
+    return;
+  }
+
+  if (type === CAPTURE_EVENT_TYPES.ACK) {
+    session.acked = true;
+    if (session.ackTimer !== null) {
+      clearTimeout(session.ackTimer);
+      session.ackTimer = null;
+    }
+
+    logInfo('Network capture session acknowledged.', {
+      taskId,
+      targetSite: session.targetSite
+    });
+    return;
+  }
+
+  if (type === CAPTURE_EVENT_TYPES.CHUNK) {
+    const chunk = typeof payload.chunk === 'string' ? payload.chunk : '';
+    if (!chunk) {
+      return;
+    }
+
+    session.chunks.push(chunk);
+    session.chunkCount += 1;
+    if (typeof payload.captureChannel === 'string' && payload.captureChannel) {
+      session.captureChannel = payload.captureChannel;
+    }
+    if (typeof payload.captureSourceUrl === 'string' && payload.captureSourceUrl) {
+      session.captureSourceUrl = payload.captureSourceUrl;
+    }
+
+    if (session.chunkCount === 1 || session.chunkCount % 20 === 0) {
+      logInfo('Network capture chunk received.', {
+        taskId,
+        targetSite: session.targetSite,
+        chunkCount: session.chunkCount,
+        chunkLength: chunk.length,
+        captureChannel: session.captureChannel || null
+      });
+      logResponsePreview('candidate_detected', chunk);
+    }
+    return;
+  }
+
+  if (type === CAPTURE_EVENT_TYPES.STREAM_END) {
+    logInfo('Network capture stream-end signal received.', {
+      taskId,
+      targetSite: session.targetSite,
+      captureChannel: typeof payload.captureChannel === 'string' ? payload.captureChannel : null,
+      captureSourceUrl: typeof payload.captureSourceUrl === 'string' ? payload.captureSourceUrl : null
+    });
+    return;
+  }
+
+  if (type === CAPTURE_EVENT_TYPES.ERROR) {
+    const errorMessage =
+      typeof payload.error === 'string' && payload.error.trim() ? payload.error.trim() : 'Unknown capture error';
+    failNetworkCaptureSession(taskId, errorMessage, {
+      captureChannel: typeof payload.captureChannel === 'string' ? payload.captureChannel : null,
+      captureSourceUrl: typeof payload.captureSourceUrl === 'string' ? payload.captureSourceUrl : null
+    });
+    return;
+  }
+
+  if (type === CAPTURE_EVENT_TYPES.FINAL) {
+    finalizeNetworkCaptureSession(taskId, {
+      reason: typeof payload.reason === 'string' ? payload.reason : '',
+      captureChannel: typeof payload.captureChannel === 'string' ? payload.captureChannel : '',
+      captureSourceUrl: typeof payload.captureSourceUrl === 'string' ? payload.captureSourceUrl : '',
+      chunkCount: Number(payload.captureChunkCount),
+      durationMs: Number(payload.captureDurationMs)
+    });
+  }
+}
+
+/**
+ * Initializes one-time bridge listener between content world and main world.
+ */
+function ensureCaptureBridgeInitialized() {
+  if (captureBridgeInitialized) {
+    return;
+  }
+
+  captureBridgeInitialized = true;
+  window.addEventListener('message', handleMainCaptureEvent);
+  logInfo('Network capture bridge initialized.');
+}
+
+/**
+ * Starts one network capture session for the task and returns final result promise.
+ * @param {{taskId: string, targetSite: string}} taskContext
+ * @returns {Promise<{responseText: string, captureMeta: {captureMethod:string,captureChannel:string,captureSourceUrl:string,captureChunkCount:number,captureDurationMs:number}}>}
+ */
+function startNetworkCaptureSession(taskContext) {
+  ensureCaptureBridgeInitialized();
+
+  const taskId = taskContext.taskId;
+  if (!taskId) {
+    throw new Error('Cannot start network capture without taskId.');
+  }
+
+  if (networkCaptureSessions.has(taskId)) {
+    failNetworkCaptureSession(taskId, 'Duplicate capture session start requested.');
+  }
+
   return new Promise((resolve, reject) => {
-    const startedAt = Date.now();
-    let lastCandidate = '';
-    let stableRounds = 0;
-    let pollRounds = 0;
+    const session = {
+      taskId,
+      targetSite: taskContext.targetSite,
+      startedAt: Date.now(),
+      chunks: [],
+      chunkCount: 0,
+      captureChannel: '',
+      captureSourceUrl: '',
+      acked: false,
+      completed: false,
+      ackTimer: null,
+      hardTimer: null,
+      resolve,
+      reject
+    };
 
-    logInfo('Assistant response capture started.', {
-      site: adapter.id,
-      baselineCount: baselineResponses.size,
-      timeoutMs: RESPONSE_CAPTURE_TIMEOUT_MS,
-      pollIntervalMs: RESPONSE_CAPTURE_POLL_MS,
-      stableRoundsRequired: RESPONSE_STABLE_ROUNDS
+    session.ackTimer = setTimeout(() => {
+      failNetworkCaptureSession(taskId, 'Timed out waiting capture ACK.', {
+        timeoutMs: CAPTURE_ACK_TIMEOUT_MS
+      });
+    }, CAPTURE_ACK_TIMEOUT_MS);
+
+    session.hardTimer = setTimeout(() => {
+      failNetworkCaptureSession(taskId, 'Timed out waiting capture FINAL.', {
+        timeoutMs: CAPTURE_HARD_TIMEOUT_MS
+      });
+    }, CAPTURE_HARD_TIMEOUT_MS);
+
+    networkCaptureSessions.set(taskId, session);
+    logInfo('Network capture session started.', {
+      taskId,
+      targetSite: taskContext.targetSite,
+      ackTimeoutMs: CAPTURE_ACK_TIMEOUT_MS,
+      hardTimeoutMs: CAPTURE_HARD_TIMEOUT_MS
     });
 
-    const timer = setInterval(() => {
-      try {
-        pollRounds += 1;
-        const currentResponses = collectAssistantResponseTexts(adapter);
-        const candidate = pickLatestFreshResponse(currentResponses, baselineResponses);
-
-        if (candidate) {
-          if (candidate === lastCandidate) {
-            stableRounds += 1;
-          } else {
-            lastCandidate = candidate;
-            stableRounds = 1;
-            logInfo('Assistant response candidate detected.', {
-              site: adapter.id,
-              pollRounds,
-              currentResponseCount: currentResponses.length,
-              candidateLength: candidate.length,
-              candidatePreview: buildTextPreview(candidate)
-            });
-          }
-
-          logInfo('Assistant response candidate stability progress.', {
-            site: adapter.id,
-            pollRounds,
-            stableRounds,
-            stableRoundsRequired: RESPONSE_STABLE_ROUNDS,
-            candidateLength: candidate.length
-          });
-
-          if (stableRounds >= RESPONSE_STABLE_ROUNDS) {
-            clearInterval(timer);
-            logInfo('Assistant response stabilized.', {
-              site: adapter.id,
-              pollRounds,
-              stableRounds,
-              responseLength: candidate.length,
-              responsePreview: buildTextPreview(candidate)
-            });
-            resolve(candidate);
-            return;
-          }
-        } else if (pollRounds % 10 === 0) {
-          logInfo('Assistant response capture polling heartbeat.', {
-            site: adapter.id,
-            pollRounds,
-            currentResponseCount: currentResponses.length,
-            baselineCount: baselineResponses.size
-          });
-        }
-
-        if (Date.now() - startedAt > RESPONSE_CAPTURE_TIMEOUT_MS) {
-          clearInterval(timer);
-          console.error('Assistant response capture timed out.', {
-            site: adapter.id,
-            pollRounds,
-            baselineCount: baselineResponses.size,
-            lastCandidateLength: lastCandidate.length,
-            lastCandidatePreview: buildTextPreview(lastCandidate)
-          });
-          reject(new Error(`Timed out waiting for assistant response on ${adapter.id}`));
-        }
-      } catch (error) {
-        clearInterval(timer);
-        console.error('Assistant response capture polling failed.', {
-          site: adapter.id,
-          pollRounds,
-          error: String(error)
-        });
-        reject(error);
-      }
-    }, RESPONSE_CAPTURE_POLL_MS);
+    try {
+      postCaptureControlEvent(CAPTURE_EVENT_TYPES.START, {
+        taskId: session.taskId,
+        targetSite: session.targetSite,
+        startedAt: session.startedAt
+      });
+    } catch (error) {
+      failNetworkCaptureSession(taskId, error instanceof Error ? error : String(error), {
+        phase: 'post_start_event'
+      });
+    }
   });
 }
 
@@ -636,8 +949,9 @@ function waitForStableAssistantResponse(adapter, baselineResponses) {
  * Reports one captured assistant response back to background for provider syncing.
  * @param {{taskId: string, targetSite: string, sourceUrl: string, sourceTitle: string}} taskContext
  * @param {string} responseText
+ * @param {{captureMethod:string,captureChannel:string,captureSourceUrl:string,captureChunkCount:number,captureDurationMs:number}} captureMeta
  */
-async function reportAssistantResponse(taskContext, responseText) {
+async function reportAssistantResponse(taskContext, responseText, captureMeta) {
   if (!taskContext.taskId || !responseText) {
     logInfo('Skip assistant response report due to invalid payload.', {
       taskId: taskContext.taskId || null,
@@ -653,7 +967,12 @@ async function reportAssistantResponse(taskContext, responseText) {
     sourceUrl: taskContext.sourceUrl,
     sourceTitle: taskContext.sourceTitle,
     aiResponse: responseText,
-    capturedAt: new Date().toISOString()
+    capturedAt: new Date().toISOString(),
+    captureMethod: captureMeta.captureMethod,
+    captureChannel: captureMeta.captureChannel,
+    captureSourceUrl: captureMeta.captureSourceUrl,
+    captureChunkCount: captureMeta.captureChunkCount,
+    captureDurationMs: captureMeta.captureDurationMs
   };
 
   logInfo('Reporting assistant response to background.', {
@@ -662,8 +981,14 @@ async function reportAssistantResponse(taskContext, responseText) {
     sourceUrl: taskContext.sourceUrl || null,
     sourceTitle: taskContext.sourceTitle || null,
     responseLength: responseText.length,
-    responsePreview: buildTextPreview(responseText)
+    responsePreview: buildTextPreview(responseText),
+    captureMethod: captureMeta.captureMethod,
+    captureChannel: captureMeta.captureChannel,
+    captureSourceUrl: captureMeta.captureSourceUrl || null,
+    captureChunkCount: captureMeta.captureChunkCount,
+    captureDurationMs: captureMeta.captureDurationMs
   });
+  logResponsePreview('reporting', responseText);
 
   const reportResult = await sendRuntimeMessage(payload);
   logInfo('Assistant response report acknowledged by background.', {
@@ -671,48 +996,6 @@ async function reportAssistantResponse(taskContext, responseText) {
     targetSite: taskContext.targetSite,
     result: reportResult || null
   });
-}
-
-/**
- * Starts async response capture and report pipeline for one dispatched task.
- * @param {{id:string,responseSelectors:string[]}} adapter
- * @param {{taskId: string, targetSite: string, sourceUrl: string, sourceTitle: string}} taskContext
- * @param {Set<string>} baselineResponses
- */
-function startAssistantResponseCapture(adapter, taskContext, baselineResponses) {
-  if (!taskContext.taskId || reportingTaskIds.has(taskContext.taskId) || reportedTaskIds.has(taskContext.taskId)) {
-    logInfo('Skip assistant response capture bootstrap.', {
-      site: adapter.id,
-      taskId: taskContext.taskId || null,
-      alreadyReporting: taskContext.taskId ? reportingTaskIds.has(taskContext.taskId) : false,
-      alreadyReported: taskContext.taskId ? reportedTaskIds.has(taskContext.taskId) : false
-    });
-    return;
-  }
-
-  logInfo('Assistant response capture pipeline bootstrapped.', {
-    site: adapter.id,
-    taskId: taskContext.taskId,
-    baselineCount: baselineResponses.size
-  });
-
-  reportingTaskIds.add(taskContext.taskId);
-  waitForStableAssistantResponse(adapter, baselineResponses)
-    .then(async (responseText) => {
-      await reportAssistantResponse(taskContext, responseText);
-      reportedTaskIds.add(taskContext.taskId);
-      logInfo('Assistant response captured and reported.', {
-        site: adapter.id,
-        taskId: taskContext.taskId,
-        responseLength: responseText.length
-      });
-    })
-    .catch((error) => {
-      console.error('Failed to capture assistant response:', error);
-    })
-    .finally(() => {
-      reportingTaskIds.delete(taskContext.taskId);
-    });
 }
 
 /**
@@ -727,6 +1010,7 @@ async function runWithText(finalText, preferredSiteId, incomingTaskContext) {
     return;
   }
 
+  let taskContext = null;
   isRunning = true;
   try {
     if (!finalText || typeof finalText !== 'string') {
@@ -740,7 +1024,7 @@ async function runWithText(finalText, preferredSiteId, incomingTaskContext) {
       return;
     }
 
-    const taskContext = resolveTaskContext(adapter, incomingTaskContext);
+    taskContext = resolveTaskContext(adapter, incomingTaskContext);
     if (isRecentlyExecuted(finalText, taskContext.taskId)) {
       logInfo('Skip duplicate payload in dedupe window.', {
         textLength: finalText.length,
@@ -749,7 +1033,12 @@ async function runWithText(finalText, preferredSiteId, incomingTaskContext) {
       return;
     }
 
-    const baselineResponses = new Set(collectAssistantResponseTexts(adapter));
+    let capturePromise = null;
+    try {
+      capturePromise = startNetworkCaptureSession(taskContext);
+    } catch (error) {
+      console.error('Failed to start network capture session:', error);
+    }
 
     markExecution(finalText, taskContext.taskId);
     const composer = await waitForComposer(adapter);
@@ -764,9 +1053,29 @@ async function runWithText(finalText, preferredSiteId, incomingTaskContext) {
     // Give UI state a short time to enable send action.
     await waitMs(500);
     triggerSend(adapter, composer);
-    startAssistantResponseCapture(adapter, taskContext, baselineResponses);
+
+    if (!capturePromise) {
+      console.error('Network capture session unavailable, skip response reporting.', {
+        site: adapter.id,
+        taskId: taskContext.taskId
+      });
+      return;
+    }
+
+    const captureResult = await capturePromise;
+    await reportAssistantResponse(taskContext, captureResult.responseText, captureResult.captureMeta);
+    logInfo('Assistant response captured and reported via network intercept.', {
+      site: adapter.id,
+      taskId: taskContext.taskId,
+      responseLength: captureResult.responseText.length,
+      captureChannel: captureResult.captureMeta.captureChannel,
+      captureChunkCount: captureResult.captureMeta.captureChunkCount
+    });
   } catch (error) {
     console.error('Failed to run auto-send flow:', error);
+    if (taskContext && taskContext.taskId) {
+      cleanupNetworkCaptureSession(taskContext.taskId, 'send_flow_failed');
+    }
   } finally {
     // Avoid duplicate sends while still allowing subsequent tasks later.
     setTimeout(() => {
@@ -817,6 +1126,11 @@ async function runFromUrlPrompt() {
 
   try {
     const taskId = readTaskIdFromUrl() || undefined;
+    if (taskId) {
+      logInfo('Skip URL prompt auto-send when taskId exists; waiting runtime delivery.', { taskId });
+      return;
+    }
+
     const sourceUrl = readSourceUrlFromUrl();
     const sourceTitle = readSourceTitleFromUrl();
     logInfo('Starting URL prompt auto-send flow.', {

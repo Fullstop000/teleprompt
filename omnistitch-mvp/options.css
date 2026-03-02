@@ -70,12 +70,6 @@ h2 {
   height: 16px;
 }
 
-.notion-hint {
-  margin: 0 0 4px;
-  font-size: 13px;
-  color: var(--ui-muted);
-}
-
 .sync-provider-hint {
   margin: 0 0 4px;
   font-size: 13px;

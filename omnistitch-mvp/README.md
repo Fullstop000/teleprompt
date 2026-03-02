@@ -6,7 +6,7 @@
 - 自动填入“当前 Prompt + 当前页面 URL”。
 - 自动点击发送。
 - 支持 Prompt 管理（新增/编辑/删除/设为当前）。
-- 支持将 AI 回复自动同步到“同步目标”系统（可切换 provider：关闭 / Webhook / Notion / Obsidian）。
+- 支持将 AI 回复自动同步到“同步目标”系统（可切换 provider：关闭 / Webhook / Obsidian）。
 
 ## 安装
 1. 打开 `chrome://extensions/`。
@@ -20,8 +20,7 @@
 2. 在 `Extension options` 的“同步目标”区域选择 provider：
    - `关闭同步`：只发送，不外部同步。
    - `Webhook`：将结果 POST 到你的 webhook URL。
-   - `Notion`：写入 Notion 数据库。
-   - `Obsidian`：通过 Obsidian Local REST API 写入周期笔记。
+   - `Obsidian`：通过 Obsidian Local REST API 创建独立 note。
 3. 打开任意 `http/https` 博客页面。
 4. 点击扩展图标 `OmniStitch MVP`。
 5. 等待自动跳转所选目标站点并发送。
@@ -33,8 +32,12 @@
   - `time`
   - `aiResponse`
   - `sourceUrl`
-- Notion provider 要求数据库存在字段：`AI回复`、`target`、`时间`、`taskid`。
 - Obsidian provider 为每条 AI 回复创建一个新 note（`PUT /vault/{filename}`），默认写入 `Daily/OmniStitch/YYYY-MM-DD/{article-title}/{target}/`。
+
+## 回复抓取机制
+- 扩展在目标站点标签页注入 main-world 脚本，拦截 `fetch` / `XMLHttpRequest` / `WebSocket` / `EventSource` 的流式文本。
+- content script 通过 `window.postMessage` 与 main-world 脚本通信（START/ACK/CHUNK/FINAL）。
+- 抓取日志仅输出长度与 100 字符预览，不打印完整正文。
 
 ## Prompt 管理
 1. 打开 `chrome://extensions/`。
@@ -45,6 +48,7 @@
 ## 已知限制
 - 需保证你已登录所选目标站点（ChatGPT/Kimi/DeepSeek/Gemini）。
 - 目标站点页面结构变更时，`content.js` 的选择器可能需要更新。
+- 目标站点接口形态变化时，网络流 URL 过滤规则可能需要更新。
 
 ## 快捷键一键触发
 - 默认快捷键：
@@ -63,5 +67,22 @@
 - 同步未生效：
   1. 先确认“同步目标”配置已保存。
   2. Webhook 模式下检查 URL 可达与服务端返回状态码。
-  3. Notion 模式下确认 token/database 权限和字段名。
-  4. Obsidian 模式下确认 Local REST API 插件已开启，Base URL/API Key 正确。
+  3. Obsidian 模式下确认 Local REST API 插件已开启，Base URL/API Key 正确。
+- 回复未抓取到：
+  1. 打开目标站点控制台，搜索 `OMNISTITCH_CAPTURE_ACK`、`response_preview_100`。
+  2. 若长期无 ACK，检查扩展是否已授权 `scripting` 权限并重载扩展。
+  3. 若有 ACK 但无 FINAL，检查站点是否命中网络过滤规则（日志含 `captureSourceUrl`）。
+
+## Headless 真实测试
+- 脚本：`omnistitch-mvp/scripts/headless-e2e-smoke.mjs`
+- 作用：headless 启动浏览器并加载扩展，直接触发发送链路，验证四个 target（ChatGPT/Kimi/DeepSeek/Gemini）是否被拉起。
+- 执行：
+  - `node omnistitch-mvp/scripts/headless-e2e-smoke.mjs`
+- 可选参数（`--key=value`）：
+  - `--chrome-path=/path/to/chrome`
+  - `--timeout-ms=60000`
+  - `--source-url=https://example.com/article`
+  - `--source-title=MyTitle`
+- 结果判断：
+  - 输出 JSON 中 `ok: true` 表示“扩展加载 + 触发成功 + 四目标站点都被拉起”。
+  - 如需固定 profile（例如复用登录态），可设置环境变量：`OMNISTITCH_HEADLESS_PROFILE=/tmp/my-profile`。

@@ -10,7 +10,6 @@ const TARGET_SITE_LABELS = {
 };
 const SYNC_PROVIDER_IDS = {
   DISABLED: 'disabled',
-  NOTION: 'notion',
   WEBHOOK: 'webhook',
   OBSIDIAN: 'obsidian'
 };
@@ -53,15 +52,13 @@ function createDefaultTargetSettings() {
 
 /**
  * Creates default sync-target settings.
- * @returns {{provider:string,autoSync:boolean,retryEnabled:boolean,notionToken:string,notionDatabaseId:string,webhookUrl:string,webhookAuthToken:string,obsidianBaseUrl:string,obsidianApiKey:string}}
+ * @returns {{provider:string,autoSync:boolean,retryEnabled:boolean,webhookUrl:string,webhookAuthToken:string,obsidianBaseUrl:string,obsidianApiKey:string}}
  */
 function createDefaultSyncTargetSettings() {
   return {
     provider: SYNC_PROVIDER_IDS.DISABLED,
     autoSync: true,
     retryEnabled: true,
-    notionToken: '',
-    notionDatabaseId: '',
     webhookUrl: '',
     webhookAuthToken: '',
     obsidianBaseUrl: 'https://127.0.0.1:27124',
@@ -77,7 +74,6 @@ function createDefaultSyncTargetSettings() {
 function isValidProvider(provider) {
   return (
     provider === SYNC_PROVIDER_IDS.DISABLED ||
-    provider === SYNC_PROVIDER_IDS.NOTION ||
     provider === SYNC_PROVIDER_IDS.WEBHOOK ||
     provider === SYNC_PROVIDER_IDS.OBSIDIAN
   );
@@ -117,17 +113,13 @@ function normalizeTargetSettings(settings) {
 /**
  * Normalizes sync-target settings using current schema only.
  * @param {Record<string, unknown>|undefined} settings
- * @returns {{provider:string,autoSync:boolean,retryEnabled:boolean,notionToken:string,notionDatabaseId:string,webhookUrl:string,webhookAuthToken:string,obsidianBaseUrl:string,obsidianApiKey:string}}
+ * @returns {{provider:string,autoSync:boolean,retryEnabled:boolean,webhookUrl:string,webhookAuthToken:string,obsidianBaseUrl:string,obsidianApiKey:string}}
  */
 function normalizeSyncTargetSettings(settings) {
   const defaults = createDefaultSyncTargetSettings();
   const data = settings && typeof settings === 'object' ? settings : {};
 
   const rawProvider = typeof data.provider === 'string' ? data.provider.trim() : '';
-  const notionToken =
-    typeof data.notionToken === 'string' ? data.notionToken.trim() : defaults.notionToken;
-  const notionDatabaseId =
-    typeof data.notionDatabaseId === 'string' ? data.notionDatabaseId.trim() : defaults.notionDatabaseId;
   const webhookUrl = typeof data.webhookUrl === 'string' ? data.webhookUrl.trim() : defaults.webhookUrl;
   const webhookAuthToken =
     typeof data.webhookAuthToken === 'string' ? data.webhookAuthToken.trim() : defaults.webhookAuthToken;
@@ -144,8 +136,6 @@ function normalizeSyncTargetSettings(settings) {
     provider,
     autoSync,
     retryEnabled,
-    notionToken,
-    notionDatabaseId,
     webhookUrl,
     webhookAuthToken,
     obsidianBaseUrl,
@@ -211,7 +201,7 @@ async function loadTargetSettings() {
 
 /**
  * Loads sync-target settings from extension local storage.
- * @returns {Promise<{provider:string,autoSync:boolean,retryEnabled:boolean,notionToken:string,notionDatabaseId:string,webhookUrl:string,webhookAuthToken:string,obsidianBaseUrl:string,obsidianApiKey:string}>}
+ * @returns {Promise<{provider:string,autoSync:boolean,retryEnabled:boolean,webhookUrl:string,webhookAuthToken:string,obsidianBaseUrl:string,obsidianApiKey:string}>}
  */
 async function loadSyncTargetSettings() {
   try {
@@ -223,8 +213,6 @@ async function loadSyncTargetSettings() {
       raw.provider === normalized.provider &&
       raw.autoSync === normalized.autoSync &&
       raw.retryEnabled === normalized.retryEnabled &&
-      raw.notionToken === normalized.notionToken &&
-      raw.notionDatabaseId === normalized.notionDatabaseId &&
       raw.webhookUrl === normalized.webhookUrl &&
       raw.webhookAuthToken === normalized.webhookAuthToken &&
       raw.obsidianBaseUrl === normalized.obsidianBaseUrl &&
@@ -273,7 +261,7 @@ async function saveTargetSettings(settings) {
 
 /**
  * Saves sync-target settings to extension local storage.
- * @param {{provider:string,autoSync:boolean,retryEnabled:boolean,notionToken:string,notionDatabaseId:string,webhookUrl:string,webhookAuthToken:string,obsidianBaseUrl:string,obsidianApiKey:string}} settings
+ * @param {{provider:string,autoSync:boolean,retryEnabled:boolean,webhookUrl:string,webhookAuthToken:string,obsidianBaseUrl:string,obsidianApiKey:string}} settings
  * @returns {Promise<void>}
  */
 async function saveSyncTargetSettings(settings) {
@@ -288,12 +276,10 @@ async function saveSyncTargetSettings(settings) {
 /**
  * Renders sync provider-specific fields.
  * @param {string} provider
- * @param {HTMLElement} notionFields
  * @param {HTMLElement} webhookFields
  * @param {HTMLElement} obsidianFields
  */
-function renderSyncProviderFields(provider, notionFields, webhookFields, obsidianFields) {
-  notionFields.hidden = provider !== SYNC_PROVIDER_IDS.NOTION;
+function renderSyncProviderFields(provider, webhookFields, obsidianFields) {
   webhookFields.hidden = provider !== SYNC_PROVIDER_IDS.WEBHOOK;
   obsidianFields.hidden = provider !== SYNC_PROVIDER_IDS.OBSIDIAN;
 }
@@ -415,11 +401,8 @@ async function init() {
   const syncWebhookAuthTokenInput = document.getElementById('sync-webhook-auth-token');
   const syncObsidianBaseUrlInput = document.getElementById('sync-obsidian-base-url');
   const syncObsidianApiKeyInput = document.getElementById('sync-obsidian-api-key');
-  const syncNotionTokenInput = document.getElementById('sync-notion-token');
-  const syncNotionDatabaseIdInput = document.getElementById('sync-notion-database-id');
   const syncWebhookFields = document.getElementById('sync-webhook-fields');
   const syncObsidianFields = document.getElementById('sync-obsidian-fields');
-  const syncNotionFields = document.getElementById('sync-notion-fields');
   const form = document.getElementById('create-form');
   const titleInput = document.getElementById('prompt-title');
   const contentInput = document.getElementById('prompt-content');
@@ -435,11 +418,8 @@ async function init() {
     !(syncWebhookAuthTokenInput instanceof HTMLInputElement) ||
     !(syncObsidianBaseUrlInput instanceof HTMLInputElement) ||
     !(syncObsidianApiKeyInput instanceof HTMLInputElement) ||
-    !(syncNotionTokenInput instanceof HTMLInputElement) ||
-    !(syncNotionDatabaseIdInput instanceof HTMLInputElement) ||
     !(syncWebhookFields instanceof HTMLElement) ||
     !(syncObsidianFields instanceof HTMLElement) ||
-    !(syncNotionFields instanceof HTMLElement) ||
     !form ||
     !titleInput ||
     !contentInput
@@ -463,12 +443,10 @@ async function init() {
   syncWebhookAuthTokenInput.value = syncSettings.webhookAuthToken;
   syncObsidianBaseUrlInput.value = syncSettings.obsidianBaseUrl;
   syncObsidianApiKeyInput.value = syncSettings.obsidianApiKey;
-  syncNotionTokenInput.value = syncSettings.notionToken;
-  syncNotionDatabaseIdInput.value = syncSettings.notionDatabaseId;
-  renderSyncProviderFields(syncProviderSelect.value, syncNotionFields, syncWebhookFields, syncObsidianFields);
+  renderSyncProviderFields(syncProviderSelect.value, syncWebhookFields, syncObsidianFields);
 
   syncProviderSelect.addEventListener('change', () => {
-    renderSyncProviderFields(syncProviderSelect.value, syncNotionFields, syncWebhookFields, syncObsidianFields);
+    renderSyncProviderFields(syncProviderSelect.value, syncWebhookFields, syncObsidianFields);
   });
 
   targetForm.addEventListener('submit', async (event) => {
@@ -499,19 +477,12 @@ async function init() {
     const provider = isValidProvider(syncProviderSelect.value)
       ? syncProviderSelect.value
       : SYNC_PROVIDER_IDS.DISABLED;
-    const notionToken = syncNotionTokenInput.value.trim();
-    const notionDatabaseId = syncNotionDatabaseIdInput.value.trim();
     const webhookUrl = syncWebhookUrlInput.value.trim();
     const webhookAuthToken = syncWebhookAuthTokenInput.value.trim();
     const obsidianBaseUrl = syncObsidianBaseUrlInput.value.trim();
     const obsidianApiKey = syncObsidianApiKeyInput.value.trim();
     const autoSync = syncAutoSyncInput.checked;
     const retryEnabled = syncRetryEnabledInput.checked;
-
-    if (provider === SYNC_PROVIDER_IDS.NOTION && (!notionToken || !notionDatabaseId)) {
-      setStatus('使用 Notion 同步时，请填写 Notion Token 与 Database ID。');
-      return;
-    }
 
     if (provider === SYNC_PROVIDER_IDS.WEBHOOK) {
       if (!webhookUrl) {
@@ -554,8 +525,6 @@ async function init() {
         provider,
         autoSync,
         retryEnabled,
-        notionToken,
-        notionDatabaseId,
         webhookUrl,
         webhookAuthToken,
         obsidianBaseUrl,
