@@ -34,12 +34,14 @@ async function sync(payload, settings) {
     headers.Authorization = `Bearer ${settings.webhookAuthToken}`;
   }
 
-  // Capture dump is debug-only and must never be sent to external sync store.
-  const { captureDump: _captureDump, ...sanitizedRawPayload } = payload || {};
+  // Capture dump is test-only. Include it only when content script explicitly provides it.
   const enrichedRawPayload = {
-    ...sanitizedRawPayload,
+    ...(payload || {}),
     agentSite: payload.targetSite
   };
+  if (!(typeof enrichedRawPayload.captureDump === 'string' && enrichedRawPayload.captureDump.trim())) {
+    delete enrichedRawPayload.captureDump;
+  }
 
   const response = await fetch(parsedUrl.toString(), {
     method: 'POST',

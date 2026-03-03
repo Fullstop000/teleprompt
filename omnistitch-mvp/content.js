@@ -332,13 +332,13 @@ async function runAdapterModeSwitcher(adapter) {
 }
 
 /**
- * Reads target adapters from registry scripts loaded before content runtime.
+ * Reads agent adapters from registry scripts loaded before content runtime.
  * @returns {Array<{id:string,name:string,responseExtractor?:Function,modeSwitcher?:Function,hostnames:string[],composerSelectors:string[],sendButtonSelectors:string[]}>}
  */
-function getTargetSiteAdapters() {
-  const adapters = globalThis.TARGET_SITE_ADAPTERS;
+function getAgentSiteAdapters() {
+  const adapters = globalThis.AGENT_SITE_ADAPTERS;
   if (!Array.isArray(adapters)) {
-    console.error('Target adapter registry is missing or invalid.');
+    console.error('Agent adapter registry is missing or invalid.');
     return [];
   }
 
@@ -346,13 +346,13 @@ function getTargetSiteAdapters() {
 }
 
 /**
- * Detects current target site adapter from location hostname.
+ * Detects current agent site adapter from location hostname.
  * @returns {{id:string,name:string,responseExtractor?:Function,modeSwitcher?:Function,hostnames:string[],composerSelectors:string[],sendButtonSelectors:string[]} | null}
  */
 function detectCurrentSiteAdapter() {
   const hostname = window.location.hostname.toLowerCase();
 
-  for (const adapter of getTargetSiteAdapters()) {
+  for (const adapter of getAgentSiteAdapters()) {
     const isMatch = adapter.hostnames.some(
       (domain) => hostname === domain || hostname.endsWith(`.${domain}`)
     );
@@ -374,7 +374,7 @@ function getSiteAdapterById(siteId) {
     return null;
   }
 
-  for (const adapter of getTargetSiteAdapters()) {
+  for (const adapter of getAgentSiteAdapters()) {
     if (adapter.id === siteId) {
       return adapter;
     }
@@ -1753,8 +1753,9 @@ function startNetworkCaptureSession(taskContext) {
  * @param {{taskId: string, targetSite: string, sourceUrl: string, sourceTitle: string}} taskContext
  * @param {string} responseText
  * @param {{captureMethod:string,captureChannel:string,captureSourceUrl:string,captureChunkCount:number,captureDurationMs:number}} captureMeta
+ * @param {string|undefined} captureDump
  */
-async function reportAssistantResponse(taskContext, responseText, captureMeta) {
+async function reportAssistantResponse(taskContext, responseText, captureMeta, captureDump) {
   if (!taskContext.taskId || !responseText) {
     logInfo('Skip assistant response report due to invalid payload.', {
       taskId: taskContext.taskId || null,
@@ -1778,6 +1779,9 @@ async function reportAssistantResponse(taskContext, responseText, captureMeta) {
     captureChunkCount: captureMeta.captureChunkCount,
     captureDurationMs: captureMeta.captureDurationMs
   };
+  if (typeof captureDump === 'string' && captureDump.trim()) {
+    payload.captureDump = captureDump;
+  }
 
   logInfo('Reporting assistant response to background.', {
     taskId: taskContext.taskId,
@@ -1790,7 +1794,8 @@ async function reportAssistantResponse(taskContext, responseText, captureMeta) {
     captureChannel: captureMeta.captureChannel,
     captureSourceUrl: captureMeta.captureSourceUrl || null,
     captureChunkCount: captureMeta.captureChunkCount,
-    captureDurationMs: captureMeta.captureDurationMs
+    captureDurationMs: captureMeta.captureDurationMs,
+    captureDumpLength: typeof payload.captureDump === 'string' ? payload.captureDump.length : 0
   });
   logResponsePreview('reporting', responseText);
 
@@ -1899,7 +1904,8 @@ async function runWithText(finalText, preferredSiteId, incomingTaskContext) {
       await reportAssistantResponse(
         taskContext,
         sanitizedResponseText,
-        captureResult.captureMeta
+        captureResult.captureMeta,
+        captureResult.captureDump
       );
       logInfo('Assistant response captured and reported via network intercept.', {
         site: adapter.id,
@@ -1930,7 +1936,7 @@ async function runWithText(finalText, preferredSiteId, incomingTaskContext) {
             };
 
       if (fallbackCaptureDump) {
-        await reportAssistantResponse(taskContext, fallbackResponseText, fallbackCaptureMeta);
+        await reportAssistantResponse(taskContext, fallbackResponseText, fallbackCaptureMeta, fallbackCaptureDump);
         logInfo('Capture failure fallback report sent with dump.', {
           site: adapter.id,
           taskId: taskContext.taskId,

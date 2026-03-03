@@ -21,7 +21,6 @@ const TASK_PARAM = 'omnistitch_task';
 const SOURCE_URL_PARAM = 'omnistitch_source';
 const SOURCE_TITLE_PARAM = 'omnistitch_title';
 const CAPTURE_DUMP_PARAM = 'omnistitch_capture_dump';
-const ENABLE_CAPTURE_DUMP_QUERY = true;
 const MESSAGE_RETRY_LIMIT = 8;
 const MESSAGE_RETRY_DELAY_MS = 600;
 const CAPTURE_NETWORK_TRACK_START_ACTION = 'omnistitch_capture_network_track_start';
@@ -652,7 +651,7 @@ async function loadSyncTargetSettings() {
 
 /**
  * Loads retry queue from current schema key.
- * @returns {Promise<Array<{id:string,payload:{taskId:string,targetSite:string,sourceUrl:string,sourceTitle:string,aiResponse:string,capturedAt:string,captureMethod:string,captureChannel:string,captureSourceUrl:string,captureChunkCount:number,captureDurationMs:number},providerId:string,attempts:number,lastError:string,updatedAt:string}>>}
+ * @returns {Promise<Array<{id:string,payload:{taskId:string,targetSite:string,sourceUrl:string,sourceTitle:string,aiResponse:string,capturedAt:string,captureMethod:string,captureChannel:string,captureSourceUrl:string,captureChunkCount:number,captureDurationMs:number,captureDump?:string},providerId:string,attempts:number,lastError:string,updatedAt:string}>>}
  */
 async function loadSyncRetryQueue() {
   try {
@@ -670,7 +669,7 @@ async function loadSyncRetryQueue() {
 
 /**
  * Saves sync retry queue into extension storage.
- * @param {Array<{id:string,payload:{taskId:string,targetSite:string,sourceUrl:string,sourceTitle:string,aiResponse:string,capturedAt:string,captureMethod:string,captureChannel:string,captureSourceUrl:string,captureChunkCount:number,captureDurationMs:number},providerId:string,attempts:number,lastError:string,updatedAt:string}>} queue
+ * @param {Array<{id:string,payload:{taskId:string,targetSite:string,sourceUrl:string,sourceTitle:string,aiResponse:string,capturedAt:string,captureMethod:string,captureChannel:string,captureSourceUrl:string,captureChunkCount:number,captureDurationMs:number,captureDump?:string},providerId:string,attempts:number,lastError:string,updatedAt:string}>} queue
  */
 async function saveSyncRetryQueue(queue) {
   try {
@@ -752,9 +751,10 @@ function generateTaskId(targetSite) {
  * @param {{id: string, name: string, baseUrl: string, promptParam: string|null}} targetConfig
  * @param {string} finalText
  * @param {{taskId: string}} taskContext
+ * @param {{enableCaptureDump:boolean}} options
  * @returns {string}
  */
-function buildTargetUrl(targetConfig, finalText, taskContext) {
+function buildTargetUrl(targetConfig, finalText, taskContext, options) {
   try {
     const url = new URL(targetConfig.baseUrl);
     if (targetConfig.id === 'chatgpt') {
@@ -780,8 +780,8 @@ function buildTargetUrl(targetConfig, finalText, taskContext) {
       url.searchParams.set(SOURCE_TITLE_PARAM, safeTitle);
     }
 
-    // Keep dump enabled in this debug phase to collect full observed streams.
-    if (ENABLE_CAPTURE_DUMP_QUERY) {
+    // Capture dump query is enabled only in test-triggered runs.
+    if (options.enableCaptureDump === true) {
       url.searchParams.set(CAPTURE_DUMP_PARAM, '1');
     }
 
@@ -847,7 +847,7 @@ function buildProviderCredentialError(providerId) {
 /**
  * Normalizes one AI response report payload before syncing.
  * @param {{taskId?: string, targetSite?: string, agentSite?: string, sourceUrl?: string, sourceTitle?: string, aiResponse?: string, capturedAt?: string, captureMethod?: string, captureChannel?: string, captureSourceUrl?: string, captureChunkCount?: number|string, captureDurationMs?: number|string, captureDump?: string}} message
- * @returns {{taskId: string, targetSite: string, sourceUrl: string, sourceTitle: string, aiResponse: string, capturedAt: string, captureMethod: string, captureChannel: string, captureSourceUrl: string, captureChunkCount: number, captureDurationMs: number}}
+ * @returns {{taskId: string, targetSite: string, sourceUrl: string, sourceTitle: string, aiResponse: string, capturedAt: string, captureMethod: string, captureChannel: string, captureSourceUrl: string, captureChunkCount: number, captureDurationMs: number, captureDump?: string}}
  */
 function normalizeAiResponsePayload(message) {
   const taskId = typeof message.taskId === 'string' ? message.taskId.trim() : '';
@@ -885,11 +885,12 @@ function normalizeAiResponsePayload(message) {
       : '';
   const captureChunkCountValue = Number(message.captureChunkCount);
   const captureDurationMsValue = Number(message.captureDurationMs);
+  const captureDump = typeof message.captureDump === 'string' && message.captureDump.trim() ? message.captureDump : '';
   const captureChunkCount =
     Number.isFinite(captureChunkCountValue) && captureChunkCountValue >= 0 ? captureChunkCountValue : 0;
   const captureDurationMs =
     Number.isFinite(captureDurationMsValue) && captureDurationMsValue >= 0 ? captureDurationMsValue : 0;
-  return {
+  const normalizedPayload = {
     taskId,
     targetSite,
     sourceUrl,
@@ -902,6 +903,24 @@ function normalizeAiResponsePayload(message) {
     captureChunkCount,
     captureDurationMs
   };
+  if (captureDump) {
+    normalizedPayload.captureDump = captureDump;
+  }
+
+  return normalizedPayload;
+}
+
+/**
+ * Reads optional capture dump length from normalized payload.
+ * @param {{captureDump?: string}} payload
+ * @returns {number}
+ */
+function getCaptureDumpLength(payload) {
+  if (!payload || typeof payload.captureDump !== 'string') {
+    return 0;
+  }
+
+  return payload.captureDump.length;
 }
 
 /**
@@ -932,7 +951,7 @@ function getObsidianProvider() {
 
 /**
  * Dispatches sync payload to active provider implementation.
- * @param {{taskId: string, targetSite: string, sourceUrl: string, sourceTitle: string, aiResponse: string, capturedAt: string, captureMethod: string, captureChannel: string, captureSourceUrl: string, captureChunkCount: number, captureDurationMs: number}} payload
+ * @param {{taskId: string, targetSite: string, sourceUrl: string, sourceTitle: string, aiResponse: string, capturedAt: string, captureMethod: string, captureChannel: string, captureSourceUrl: string, captureChunkCount: number, captureDurationMs: number, captureDump?: string}} payload
  * @param {{provider:string,webhookUrl:string,webhookAuthToken:string,obsidianBaseUrl:string,obsidianApiKey:string}} settings
  * @param {string} providerId
  */
@@ -958,7 +977,7 @@ async function syncPayloadToProvider(payload, settings, providerId) {
 
 /**
  * Adds one failed payload into local retry queue.
- * @param {{taskId: string, targetSite: string, sourceUrl: string, sourceTitle: string, aiResponse: string, capturedAt: string, captureMethod: string, captureChannel: string, captureSourceUrl: string, captureChunkCount: number, captureDurationMs: number}} payload
+ * @param {{taskId: string, targetSite: string, sourceUrl: string, sourceTitle: string, aiResponse: string, capturedAt: string, captureMethod: string, captureChannel: string, captureSourceUrl: string, captureChunkCount: number, captureDurationMs: number, captureDump?: string}} payload
  * @param {string} providerId
  * @param {string} lastError
  */
@@ -1088,7 +1107,8 @@ async function handleAiResponseReport(message) {
     captureChannel: payload.captureChannel,
     captureSourceUrl: payload.captureSourceUrl || null,
     captureChunkCount: payload.captureChunkCount,
-    captureDurationMs: payload.captureDurationMs
+    captureDurationMs: payload.captureDurationMs,
+    captureDumpLength: getCaptureDumpLength(payload)
   });
 
   if (!syncSettings.autoSync || providerId === SYNC_PROVIDER_IDS.DISABLED) {
@@ -1225,9 +1245,10 @@ function attachTaskDeliveryListener(targetSite, targetName, tabId, finalText, ta
  * @param {{id: string, name: string, baseUrl: string, promptParam: string|null}} targetConfig
  * @param {string} finalText
  * @param {{taskId: string, sourceUrl: string, sourceTitle: string}} taskContext
+ * @param {{enableCaptureDump:boolean}} options
  */
-async function openTargetAndDispatchTask(targetConfig, finalText, taskContext) {
-  const targetUrl = buildTargetUrl(targetConfig, finalText, taskContext);
+async function openTargetAndDispatchTask(targetConfig, finalText, taskContext, options) {
+  const targetUrl = buildTargetUrl(targetConfig, finalText, taskContext, options);
   logInfo('Opening target tab with payload.', {
     targetSite: targetConfig.id,
     targetName: targetConfig.name,
@@ -1256,8 +1277,9 @@ async function openTargetAndDispatchTask(targetConfig, finalText, taskContext) {
 /**
  * Executes the main send flow from a browser tab context.
  * @param {chrome.tabs.Tab|undefined} tab
+ * @param {{enableCaptureDump?:boolean}|undefined} options
  */
-async function runSendFlow(tab) {
+async function runSendFlow(tab, options) {
   try {
     const currentUrl = tab?.url;
     const rawTitle = typeof tab?.title === 'string' ? tab.title.trim() : '';
@@ -1276,6 +1298,10 @@ async function runSendFlow(tab) {
     const targetSettings = await loadTargetSettings();
     const targetConfigs = resolveEnabledTargetConfigs(targetSettings);
 
+    const sendOptions = {
+      enableCaptureDump: options?.enableCaptureDump === true
+    };
+
     await Promise.all(
       targetConfigs.map((targetConfig) => {
         const taskContext = {
@@ -1283,7 +1309,7 @@ async function runSendFlow(tab) {
           sourceUrl: currentUrl,
           sourceTitle
         };
-        return openTargetAndDispatchTask(targetConfig, finalText, taskContext);
+        return openTargetAndDispatchTask(targetConfig, finalText, taskContext, sendOptions);
       })
     );
 
@@ -1318,15 +1344,22 @@ async function handleTestTriggerSendFlow(message) {
       };
     }
 
-    return runSendFlow({
-      url: sourceUrl,
-      title: sourceTitle || sourceUrl
-    });
+    return runSendFlow(
+      {
+        url: sourceUrl,
+        title: sourceTitle || sourceUrl
+      },
+      {
+        enableCaptureDump: true
+      }
+    );
   }
 
   try {
     const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-    return runSendFlow(tabs[0]);
+    return runSendFlow(tabs[0], {
+      enableCaptureDump: true
+    });
   } catch (error) {
     return {
       ok: false,
