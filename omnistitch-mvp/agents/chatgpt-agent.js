@@ -96,9 +96,9 @@ globalThis.extractChatgptResponseText = function extractChatgptResponseText(rawT
 };
 
 /**
- * ChatGPT target adapter object used by content runtime.
+ * ChatGPT agent adapter object used by content runtime.
  */
-globalThis.CHATGPT_TARGET_ADAPTER = {
+globalThis.CHATGPT_AGENT_ADAPTER = {
   id: 'chatgpt',
   name: 'ChatGPT',
   responseExtractor: globalThis.extractChatgptResponseText,

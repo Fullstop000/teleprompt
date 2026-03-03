@@ -1,12 +1,12 @@
 /**
- * Registers all available target adapters so content runtime can resolve by site.
+ * Registers all available agent adapters so content runtime can resolve by site.
  */
 (() => {
   const registeredAdapters = [
-    globalThis.CHATGPT_TARGET_ADAPTER,
-    globalThis.KIMI_TARGET_ADAPTER,
-    globalThis.DEEPSEEK_TARGET_ADAPTER,
-    globalThis.GEMINI_TARGET_ADAPTER
+    globalThis.CHATGPT_AGENT_ADAPTER,
+    globalThis.KIMI_AGENT_ADAPTER,
+    globalThis.DEEPSEEK_AGENT_ADAPTER,
+    globalThis.GEMINI_AGENT_ADAPTER
   ].filter(Boolean);
 
   const expectedCount = 4;
@@ -17,5 +17,5 @@
     });
   }
 
-  globalThis.TARGET_SITE_ADAPTERS = registeredAdapters;
+  globalThis.AGENT_SITE_ADAPTERS = registeredAdapters;
 })();

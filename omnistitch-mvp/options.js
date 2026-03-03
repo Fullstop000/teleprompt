@@ -391,7 +391,7 @@ function setStatus(message) {
  * Initializes options page and event handlers.
  */
 async function init() {
-  const targetForm = document.getElementById('target-form');
+  const targetForm = document.getElementById('agent-form');
   const targetSiteCheckboxes = document.querySelectorAll('input[name="agent-sites"]');
   const syncForm = document.getElementById('sync-form');
   const syncProviderSelect = document.getElementById('sync-provider');

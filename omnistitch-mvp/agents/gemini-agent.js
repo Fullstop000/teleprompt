@@ -98,9 +98,9 @@ globalThis.extractGeminiResponseText = function extractGeminiResponseText(rawTex
 };
 
 /**
- * Gemini target adapter object used by content runtime.
+ * Gemini agent adapter object used by content runtime.
  */
-globalThis.GEMINI_TARGET_ADAPTER = {
+globalThis.GEMINI_AGENT_ADAPTER = {
   id: 'gemini',
   name: 'Gemini',
   responseExtractor: globalThis.extractGeminiResponseText,

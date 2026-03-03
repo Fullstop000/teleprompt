@@ -121,9 +121,9 @@ globalThis.extractDeepseekResponseText = function extractDeepseekResponseText(ra
 };
 
 /**
- * DeepSeek target adapter object used by content runtime.
+ * DeepSeek agent adapter object used by content runtime.
  */
-globalThis.DEEPSEEK_TARGET_ADAPTER = {
+globalThis.DEEPSEEK_AGENT_ADAPTER = {
   id: 'deepseek',
   name: 'DeepSeek',
   responseExtractor: globalThis.extractDeepseekResponseText,

@@ -118,9 +118,9 @@ globalThis.extractKimiResponseText = function extractKimiResponseText(rawText) {
 };
 
 /**
- * Kimi target adapter object used by content runtime.
+ * Kimi agent adapter object used by content runtime.
  */
-globalThis.KIMI_TARGET_ADAPTER = {
+globalThis.KIMI_AGENT_ADAPTER = {
   id: 'kimi',
   name: 'Kimi',
   responseExtractor: globalThis.extractKimiResponseText,
