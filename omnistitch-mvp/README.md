@@ -72,17 +72,3 @@
   1. 打开目标站点控制台，搜索 `OMNISTITCH_CAPTURE_ACK`、`response_preview_100`。
   2. 若长期无 ACK，检查扩展是否已授权 `scripting` 权限并重载扩展。
   3. 若有 ACK 但无 FINAL，检查站点是否命中网络过滤规则（日志含 `captureSourceUrl`）。
-
-## Headless 真实测试
-- 脚本：`omnistitch-mvp/scripts/headless-e2e-smoke.mjs`
-- 作用：headless 启动浏览器并加载扩展，直接触发发送链路，验证四个 target（ChatGPT/Kimi/DeepSeek/Gemini）是否被拉起。
-- 执行：
-  - `node omnistitch-mvp/scripts/headless-e2e-smoke.mjs`
-- 可选参数（`--key=value`）：
-  - `--chrome-path=/path/to/chrome`
-  - `--timeout-ms=60000`
-  - `--source-url=https://example.com/article`
-  - `--source-title=MyTitle`
-- 结果判断：
-  - 输出 JSON 中 `ok: true` 表示“扩展加载 + 触发成功 + 四目标站点都被拉起”。
-  - 如需固定 profile（例如复用登录态），可设置环境变量：`OMNISTITCH_HEADLESS_PROFILE=/tmp/my-profile`。

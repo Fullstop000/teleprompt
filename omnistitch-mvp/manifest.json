@@ -8,7 +8,7 @@
     "storage",
     "activeTab",
     "alarms",
-    "scripting"
+    "webRequest"
   ],
   "host_permissions": [
     "https://*/*",
@@ -31,6 +31,22 @@
     }
   },
   "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*",
+        "https://www.kimi.com/*",
+        "https://kimi.com/*",
+        "https://chat.deepseek.com/*",
+        "https://gemini.google.com/*"
+      ],
+      "js": [
+        "response-capture-main.js"
+      ],
+      "all_frames": true,
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
     {
       "matches": [
         "https://chatgpt.com/*",

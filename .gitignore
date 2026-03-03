@@ -28,6 +28,8 @@ coverage/
 # Cache / temp
 .cache/
 .tmp/
+omnistitch-mvp/.tmp/
+omnistitch-mvp/scripts/
 tmp/
 
 # IDE / editor

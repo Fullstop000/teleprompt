@@ -6,6 +6,7 @@
     STOP: 'OMNISTITCH_CAPTURE_STOP',
     READY: 'OMNISTITCH_CAPTURE_READY',
     ACK: 'OMNISTITCH_CAPTURE_ACK',
+    OBSERVED: 'OMNISTITCH_CAPTURE_OBSERVED',
     CHUNK: 'OMNISTITCH_CAPTURE_CHUNK',
     STREAM_END: 'OMNISTITCH_CAPTURE_STREAM_END',
     FINAL: 'OMNISTITCH_CAPTURE_FINAL',
@@ -14,7 +15,10 @@
   const CAPTURE_IDLE_TIMEOUT_MS = 2500;
   const CAPTURE_HARD_TIMEOUT_MS = 180000;
   const CAPTURE_STREAM_END_GRACE_MS = 800;
+  const PRESESSION_BUFFER_MAX_EVENTS = 300;
+  const PRESESSION_BUFFER_BACKLOOK_MS = 12000;
   const URL_KEYWORDS = ['chat', 'conversation', 'assistant', 'completion', 'generate', 'response', 'stream'];
+  const KIMI_CHAT_SERVICE_PATH = '/apiv2/kimi.gateway.chat.v1.chatservice/chat';
   const TARGET_HOST_ALLOWLIST = {
     chatgpt: ['chatgpt.com', 'openai.com'],
     kimi: ['kimi.com', 'moonshot.cn'],
@@ -31,6 +35,15 @@
     'googleapis.com',
     'google.com'
   ];
+  const MAIN_LOG_PREFIX = '[omnistitch][capture-main]';
+
+  /**
+   * Writes one main-world capture debug log line.
+   * @param {...unknown} args
+   */
+  function logMainInfo(...args) {
+    console.log(MAIN_LOG_PREFIX, ...args);
+  }
 
   /**
    * Posts one capture event to content world.
@@ -65,8 +78,10 @@
    *  targetSite:string,
    *  startedAt:number,
    *  chunkCount:number,
+   *  observedCount:number,
    *  captureChannel:string,
    *  captureSourceUrl:string,
+   *  dumpAllObserved:boolean,
    *  idleTimer:number|null,
    *  hardTimer:number|null,
    *  finalTimer:number|null,
@@ -74,6 +89,11 @@
    * }}
    */
   let activeSession = null;
+  /**
+   * Buffered network events captured before content sends START.
+   * @type {Array<{eventType:'chunk'|'stream_end',captureChannel:'fetch'|'xhr'|'websocket'|'eventsource',requestUrl:string,chunk:string,timestamp:number}>}
+   */
+  let preSessionBufferedEvents = [];
 
   /**
    * Resolves one request url input to absolute URL string.
@@ -101,21 +121,33 @@
   }
 
   /**
-   * Checks whether one URL should be tracked by active session filters.
+   * Inspects one URL against host + keyword tracking rules.
    * @param {string} requestUrl
    * @param {string} targetSite
-   * @returns {boolean}
+   * @returns {{requestUrl:string,isValidUrl:boolean,isAllowedHost:boolean,hasKeyword:boolean,shouldTrack:boolean}}
    */
-  function shouldTrackRequestUrl(requestUrl, targetSite) {
+  function inspectRequestUrl(requestUrl, targetSite) {
     if (!requestUrl) {
-      return false;
+      return {
+        requestUrl: '',
+        isValidUrl: false,
+        isAllowedHost: false,
+        hasKeyword: false,
+        shouldTrack: false
+      };
     }
 
     let parsed;
     try {
       parsed = new URL(requestUrl);
     } catch (_error) {
-      return false;
+      return {
+        requestUrl,
+        isValidUrl: false,
+        isAllowedHost: false,
+        hasKeyword: false,
+        shouldTrack: false
+      };
     }
 
     const hostname = parsed.hostname.toLowerCase();
@@ -124,11 +156,170 @@
     const isAllowedHost = allowedHosts.some(
       (domain) => hostname === domain || hostname.endsWith(`.${domain}`)
     );
-    if (!isAllowedHost) {
-      return false;
+    const hasKeyword = URL_KEYWORDS.some((keyword) => pathAndSearch.includes(keyword));
+    const isKimiChatService = pathAndSearch.includes(KIMI_CHAT_SERVICE_PATH);
+
+    return {
+      requestUrl: parsed.toString(),
+      isValidUrl: true,
+      isAllowedHost,
+      hasKeyword: hasKeyword || isKimiChatService,
+      shouldTrack: isAllowedHost && (hasKeyword || isKimiChatService)
+    };
+  }
+
+  /**
+   * Checks whether one URL should be tracked by active session filters.
+   * @param {string} requestUrl
+   * @param {string} targetSite
+   * @returns {boolean}
+   */
+  function shouldTrackRequestUrl(requestUrl, targetSite) {
+    return inspectRequestUrl(requestUrl, targetSite).shouldTrack;
+  }
+
+  /**
+   * Prunes stale pre-session buffered events.
+   * @param {number} now
+   */
+  function prunePreSessionBufferedEvents(now) {
+    const threshold = now - PRESESSION_BUFFER_BACKLOOK_MS;
+    preSessionBufferedEvents = preSessionBufferedEvents.filter((item) => item.timestamp >= threshold);
+    if (preSessionBufferedEvents.length > PRESESSION_BUFFER_MAX_EVENTS) {
+      preSessionBufferedEvents = preSessionBufferedEvents.slice(
+        preSessionBufferedEvents.length - PRESESSION_BUFFER_MAX_EVENTS
+      );
+    }
+  }
+
+  /**
+   * Buffers one network event before active session is ready.
+   * @param {'chunk'|'stream_end'} eventType
+   * @param {'fetch'|'xhr'|'websocket'|'eventsource'} captureChannel
+   * @param {string} requestUrl
+   * @param {string} chunk
+   */
+  function appendPreSessionEvent(eventType, captureChannel, requestUrl, chunk) {
+    const inspected = inspectRequestUrl(requestUrl, 'unknown');
+    if (!inspected.shouldTrack) {
+      return;
     }
 
-    return URL_KEYWORDS.some((keyword) => pathAndSearch.includes(keyword));
+    const now = Date.now();
+    prunePreSessionBufferedEvents(now);
+    preSessionBufferedEvents.push({
+      eventType,
+      captureChannel,
+      requestUrl: inspected.requestUrl || requestUrl || '',
+      chunk: typeof chunk === 'string' ? chunk : '',
+      timestamp: now
+    });
+    prunePreSessionBufferedEvents(now);
+  }
+
+  /**
+   * Replays recent pre-session buffered events into one started session.
+   * @param {typeof activeSession} session
+   */
+  function flushPreSessionEventsToSession(session) {
+    if (!session) {
+      return;
+    }
+
+    const threshold = session.startedAt - PRESESSION_BUFFER_BACKLOOK_MS;
+    const candidates = preSessionBufferedEvents.filter((item) => item.timestamp >= threshold);
+    if (candidates.length === 0) {
+      return;
+    }
+
+    let replayChunkCount = 0;
+    let replayStreamEndCount = 0;
+
+    for (const item of candidates) {
+      emitObservedEvent(item.eventType, item.captureChannel, item.requestUrl, item.chunk);
+      if (!shouldTrackRequestUrl(item.requestUrl, session.targetSite)) {
+        continue;
+      }
+
+      if (item.eventType === 'chunk' && item.chunk) {
+        session.chunkCount += 1;
+        session.captureChannel = item.captureChannel;
+        session.captureSourceUrl = item.requestUrl || session.captureSourceUrl;
+        replayChunkCount += 1;
+        resetIdleFinalizeTimer();
+        postCaptureEvent(CAPTURE_EVENT_TYPES.CHUNK, {
+          taskId: session.taskId,
+          captureChannel: item.captureChannel,
+          captureSourceUrl: item.requestUrl,
+          chunk: item.chunk,
+          timestamp: item.timestamp
+        });
+        continue;
+      }
+
+      if (item.eventType === 'stream_end') {
+        replayStreamEndCount += 1;
+        postCaptureEvent(CAPTURE_EVENT_TYPES.STREAM_END, {
+          taskId: session.taskId,
+          captureChannel: item.captureChannel,
+          captureSourceUrl: item.requestUrl,
+          timestamp: item.timestamp
+        });
+      }
+    }
+
+    if (replayChunkCount > 0 || replayStreamEndCount > 0) {
+      logMainInfo(
+        `Replayed pre-session events taskId=${session.taskId} target=${session.targetSite} replayChunkCount=${replayChunkCount} replayStreamEndCount=${replayStreamEndCount}`
+      );
+    }
+    prunePreSessionBufferedEvents(Date.now());
+  }
+
+  /**
+   * Emits one raw observed network event before strict filtering.
+   * @param {'chunk'|'stream_end'} observedType
+   * @param {'fetch'|'xhr'|'websocket'|'eventsource'} captureChannel
+   * @param {string} requestUrl
+   * @param {string|undefined} chunk
+   */
+  function emitObservedEvent(observedType, captureChannel, requestUrl, chunk) {
+    if (!activeSession || !activeSession.dumpAllObserved) {
+      return;
+    }
+
+    if (observedType === 'chunk') {
+      activeSession.observedCount += 1;
+      resetIdleFinalizeTimer();
+    }
+
+    const inspected = inspectRequestUrl(requestUrl, activeSession.targetSite);
+    postCaptureEvent(CAPTURE_EVENT_TYPES.OBSERVED, {
+      taskId: activeSession.taskId,
+      observedType,
+      captureChannel,
+      captureSourceUrl: inspected.requestUrl || requestUrl || '',
+      chunk: typeof chunk === 'string' ? chunk : '',
+      chunkLength: typeof chunk === 'string' ? chunk.length : 0,
+      isValidUrl: inspected.isValidUrl,
+      isAllowedHost: inspected.isAllowedHost,
+      hasKeyword: inspected.hasKeyword,
+      passedFilter: inspected.shouldTrack,
+      timestamp: Date.now()
+    });
+
+    const preview = typeof chunk === 'string' ? chunk.replace(/\n/g, '\\n').slice(0, 100) : '';
+    logMainInfo(
+      `Observed network event taskId=${activeSession.taskId} target=${activeSession.targetSite} type=${observedType} channel=${captureChannel} passedFilter=${inspected.shouldTrack} isAllowedHost=${inspected.isAllowedHost} hasKeyword=${inspected.hasKeyword} chunkLength=${
+        typeof chunk === 'string' ? chunk.length : 0
+      } url=${inspected.requestUrl || requestUrl || ''} preview=${JSON.stringify(preview)}`
+    );
+
+    if ((inspected.requestUrl || '').toLowerCase().includes(KIMI_CHAT_SERVICE_PATH)) {
+      logMainInfo(
+        `Kimi ChatService endpoint observed taskId=${activeSession.taskId} type=${observedType} channel=${captureChannel} passedFilter=${inspected.shouldTrack} url=${inspected.requestUrl}`
+      );
+    }
   }
 
   /**
@@ -191,7 +382,13 @@
     }
 
     activeSession.idleTimer = setTimeout(() => {
-      if (!activeSession || activeSession.chunkCount <= 0) {
+      if (!activeSession) {
+        return;
+      }
+
+      const hasFilteredChunks = activeSession.chunkCount > 0;
+      const hasObservedDumpEvents = activeSession.dumpAllObserved && activeSession.observedCount > 0;
+      if (!hasFilteredChunks && !hasObservedDumpEvents) {
         return;
       }
 
@@ -218,11 +415,12 @@
 
   /**
    * Starts one active session from content START command.
-   * @param {{taskId?: string, targetSite?: string}} payload
+   * @param {{taskId?: string, targetSite?: string, dumpAllObserved?: boolean}} payload
    */
   function startSession(payload) {
     const taskId = payload && typeof payload.taskId === 'string' ? payload.taskId.trim() : '';
     const targetSite = payload && typeof payload.targetSite === 'string' ? payload.targetSite.trim() : '';
+    const dumpAllObserved = Boolean(payload && payload.dumpAllObserved === true);
     if (!taskId) {
       return;
     }
@@ -232,7 +430,10 @@
     }
 
     if (activeSession && activeSession.taskId === taskId) {
-      postCaptureEvent(CAPTURE_EVENT_TYPES.ACK, { taskId });
+      postCaptureEvent(CAPTURE_EVENT_TYPES.ACK, {
+        taskId,
+        dumpAllObserved: activeSession.dumpAllObserved
+      });
       return;
     }
 
@@ -241,8 +442,10 @@
       targetSite: targetSite || 'unknown',
       startedAt: Date.now(),
       chunkCount: 0,
+      observedCount: 0,
       captureChannel: '',
       captureSourceUrl: '',
+      dumpAllObserved,
       idleTimer: null,
       hardTimer: null,
       finalTimer: null,
@@ -254,8 +457,10 @@
     activeSession = session;
 
     postCaptureEvent(CAPTURE_EVENT_TYPES.ACK, {
-      taskId: session.taskId
+      taskId: session.taskId,
+      dumpAllObserved: session.dumpAllObserved
     });
+    flushPreSessionEventsToSession(session);
   }
 
   /**
@@ -281,15 +486,17 @@
    * @param {string} rawChunk
    */
   function handleIncomingChunk(captureChannel, requestUrl, rawChunk) {
-    if (!activeSession) {
-      return;
-    }
-
-    if (!shouldTrackRequestUrl(requestUrl, activeSession.targetSite)) {
-      return;
-    }
-
     if (typeof rawChunk !== 'string' || rawChunk.length === 0) {
+      return;
+    }
+
+    if (!activeSession) {
+      appendPreSessionEvent('chunk', captureChannel, requestUrl, rawChunk);
+      return;
+    }
+
+    emitObservedEvent('chunk', captureChannel, requestUrl, rawChunk);
+    if (!shouldTrackRequestUrl(requestUrl, activeSession.targetSite)) {
       return;
     }
 
@@ -314,9 +521,11 @@
    */
   function handleIncomingStreamEnd(captureChannel, requestUrl) {
     if (!activeSession) {
+      appendPreSessionEvent('stream_end', captureChannel, requestUrl, '');
       return;
     }
 
+    emitObservedEvent('stream_end', captureChannel, requestUrl);
     if (!shouldTrackRequestUrl(requestUrl, activeSession.targetSite)) {
       return;
     }
@@ -329,6 +538,36 @@
     });
 
     scheduleStreamEndFinalize();
+  }
+
+  /**
+   * Decodes one websocket message payload into UTF-8 text when possible.
+   * @param {unknown} data
+   * @returns {Promise<string>}
+   */
+  async function decodeWebSocketData(data) {
+    if (typeof data === 'string') {
+      return data;
+    }
+
+    try {
+      if (data instanceof ArrayBuffer) {
+        return new TextDecoder().decode(new Uint8Array(data));
+      }
+
+      if (typeof ArrayBuffer !== 'undefined' && ArrayBuffer.isView(data)) {
+        return new TextDecoder().decode(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
+      }
+
+      if (typeof Blob !== 'undefined' && data instanceof Blob) {
+        const arrayBuffer = await data.arrayBuffer();
+        return new TextDecoder().decode(new Uint8Array(arrayBuffer));
+      }
+    } catch (_error) {
+      return '';
+    }
+
+    return '';
   }
 
   /**
@@ -345,7 +584,8 @@
       const response = await nativeFetch.apply(this, args);
 
       try {
-        if (activeSession && shouldTrackRequestUrl(requestUrl, activeSession.targetSite)) {
+        const shouldMirrorWithoutSession = inspectRequestUrl(requestUrl, 'unknown').shouldTrack;
+        if (activeSession || shouldMirrorWithoutSession) {
           const clone = response.clone();
           if (clone.body && typeof clone.body.getReader === 'function') {
             const reader = clone.body.getReader();
@@ -402,7 +642,7 @@
     XMLHttpRequest.prototype.send = function wrappedSend(...args) {
       this.addEventListener('progress', () => {
         try {
-          if (!activeSession || typeof this.responseText !== 'string') {
+          if (typeof this.responseText !== 'string') {
             return;
           }
 
@@ -450,9 +690,21 @@
         protocols !== undefined ? new NativeWebSocket(url, protocols) : new NativeWebSocket(url);
       const requestUrl = toAbsoluteUrl(url);
 
-      socket.addEventListener('message', (event) => {
-        if (typeof event.data === 'string') {
-          handleIncomingChunk('websocket', requestUrl, event.data);
+      socket.addEventListener('message', async (event) => {
+        try {
+          const decoded = await decodeWebSocketData(event.data);
+          if (decoded) {
+            handleIncomingChunk('websocket', requestUrl, decoded);
+          }
+        } catch (error) {
+          if (activeSession) {
+            postCaptureEvent(CAPTURE_EVENT_TYPES.ERROR, {
+              taskId: activeSession.taskId,
+              captureChannel: 'websocket',
+              captureSourceUrl: requestUrl,
+              error: String(error)
+            });
+          }
         }
       });
       socket.addEventListener('close', () => {

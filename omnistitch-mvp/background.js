@@ -20,10 +20,23 @@ const PROMPT_PARAM = 'q';
 const TASK_PARAM = 'omnistitch_task';
 const SOURCE_URL_PARAM = 'omnistitch_source';
 const SOURCE_TITLE_PARAM = 'omnistitch_title';
+const CAPTURE_DUMP_PARAM = 'omnistitch_capture_dump';
+const ENABLE_CAPTURE_DUMP_QUERY = true;
 const MESSAGE_RETRY_LIMIT = 8;
 const MESSAGE_RETRY_DELAY_MS = 600;
-const CAPTURE_INJECTION_MAX_ATTEMPTS = 3;
-const CAPTURE_INJECTION_RETRY_DELAY_MS = 400;
+const CAPTURE_NETWORK_TRACK_START_ACTION = 'omnistitch_capture_network_track_start';
+const CAPTURE_NETWORK_TRACK_STOP_ACTION = 'omnistitch_capture_network_track_stop';
+const CAPTURE_NETWORK_WAIT_IDLE_ACTION = 'omnistitch_capture_network_wait_idle';
+const CAPTURE_NETWORK_IDLE_WINDOW_MS = 1600;
+const CAPTURE_NETWORK_WAIT_TIMEOUT_MS = 7000;
+const CAPTURE_NETWORK_WAIT_POLL_MS = 200;
+const DEBUGGER_PROTOCOL_VERSION = '1.3';
+const DEBUGGER_CAPTURE_TIMEOUT_MS = 180000;
+const DEBUGGER_CAPTURE_RETENTION_MS = 10 * 60 * 1000;
+const DEBUGGER_CAPTURE_WAIT_TIMEOUT_MS = 6000;
+const DEBUGGER_CAPTURE_WAIT_POLL_MS = 200;
+const KIMI_CHAT_SERVICE_PATH = '/apiv2/kimi.gateway.chat.v1.chatservice/chat';
+const URL_KEYWORDS = ['chat', 'conversation', 'assistant', 'completion', 'generate', 'response', 'stream'];
 const SYNC_RETRY_ALARM_NAME = 'omnistitch_sync_retry_alarm';
 const SYNC_RETRY_DELAY_MINUTES = 5;
 const SYNC_RETRY_MAX_ATTEMPTS = 20;
@@ -59,6 +72,82 @@ const TARGET_SITE_CONFIGS = {
     promptParam: null
   }
 };
+const CAPTURE_TEXT_FIELD_HINTS = [
+  'content',
+  'text',
+  'delta',
+  'answer',
+  'response',
+  'message',
+  'completion',
+  'output'
+];
+const CAPTURE_TEXT_IGNORE_HINTS = [
+  'role',
+  'id',
+  'model',
+  'type',
+  'index',
+  'finish_reason',
+  'token',
+  'created',
+  'status',
+  'scenario',
+  'time',
+  'timestamp'
+];
+
+/**
+ * Active debugger capture sessions keyed by tab id.
+ * @type {Map<number, {
+ *   tabId:number,
+ *   taskId:string,
+ *   targetSite:string,
+ *   startedAt:number,
+ *   requestIds:Set<string>,
+ *   requestUrl:string,
+ *   completed:boolean,
+ *   timeoutHandle:number|null
+ * }>}
+ */
+const debuggerCaptureSessionsByTabId = new Map();
+
+/**
+ * Captured debugger fallback response text keyed by task id.
+ * @type {Map<string, {
+ *   taskId:string,
+ *   responseText:string,
+ *   captureSourceUrl:string,
+ *   capturedAt:string,
+ *   bodyLength:number
+ * }>}
+ */
+const debuggerCapturedByTaskId = new Map();
+
+/**
+ * Active webRequest tracking sessions keyed by task id.
+ * @type {Map<string, {
+ *   taskId:string,
+ *   tabId:number,
+ *   targetSite:string,
+ *   startedAt:number,
+ *   lastActivityAt:number,
+ *   matchedRequestCount:number,
+ *   completedRequestCount:number,
+ *   inflightRequestIds:Set<string>,
+ *   requestUrlByRequestId:Map<string,string>,
+ *   lastMatchedUrl:string
+ * }>}
+ */
+const webRequestTrackingSessionsByTaskId = new Map();
+
+/**
+ * Reverse index to resolve active task id from target tab id.
+ * @type {Map<number, string>}
+ */
+const webRequestTrackingTaskIdByTabId = new Map();
+
+let debuggerListenersInstalled = false;
 
 /**
  * Writes a background debug log with a stable prefix.
@@ -76,6 +165,862 @@ function logInfo(...args) {
 async function waitMs(ms) {
   await new Promise((resolve) => {
     setTimeout(resolve, ms);
+  });
+}
+
+/**
+ * Promisified wrapper for chrome.debugger.attach.
+ * @param {{tabId:number}} target
+ * @returns {Promise<void>}
+ */
+async function attachDebugger(target) {
+  await new Promise((resolve, reject) => {
+    chrome.debugger.attach(target, DEBUGGER_PROTOCOL_VERSION, () => {
+      const err = chrome.runtime.lastError;
+      if (err) {
+        reject(new Error(err.message));
+        return;
+      }
+      resolve(undefined);
+    });
+  });
+}
+
+/**
+ * Promisified wrapper for chrome.debugger.detach.
+ * @param {{tabId:number}} target
+ * @returns {Promise<void>}
+ */
+async function detachDebugger(target) {
+  await new Promise((resolve, reject) => {
+    chrome.debugger.detach(target, () => {
+      const err = chrome.runtime.lastError;
+      if (err) {
+        reject(new Error(err.message));
+        return;
+      }
+      resolve(undefined);
+    });
+  });
+}
+
+/**
+ * Promisified wrapper for chrome.debugger.sendCommand.
+ * @param {{tabId:number}} target
+ * @param {string} method
+ * @param {Record<string, unknown>} params
+ * @returns {Promise<Record<string, unknown>>}
+ */
+async function sendDebuggerCommand(target, method, params = {}) {
+  return new Promise((resolve, reject) => {
+    chrome.debugger.sendCommand(target, method, params, (result) => {
+      const err = chrome.runtime.lastError;
+      if (err) {
+        reject(new Error(err.message));
+        return;
+      }
+
+      resolve(result || {});
+    });
+  });
+}
+
+/**
+ * Checks whether one URL is Kimi chat service request.
+ * @param {string|undefined} url
+ * @returns {boolean}
+ */
+function isKimiChatServiceUrl(url) {
+  if (typeof url !== 'string' || !url) {
+    return false;
+  }
+
+  return url.toLowerCase().includes(KIMI_CHAT_SERVICE_PATH);
+}
+
+/**
+ * Returns host allowlist for one target site.
+ * @param {string} targetSite
+ * @returns {string[]}
+ */
+function getCaptureHostAllowlist(targetSite) {
+  if (targetSite === 'chatgpt') {
+    return ['chatgpt.com', 'openai.com'];
+  }
+  if (targetSite === 'kimi') {
+    return ['kimi.com', 'moonshot.cn'];
+  }
+  if (targetSite === 'deepseek') {
+    return ['deepseek.com'];
+  }
+  if (targetSite === 'gemini') {
+    return ['gemini.google.com', 'googleapis.com', 'google.com'];
+  }
+
+  return ['chatgpt.com', 'openai.com', 'kimi.com', 'moonshot.cn', 'deepseek.com', 'gemini.google.com', 'googleapis.com', 'google.com'];
+}
+
+/**
+ * Checks whether one request URL should be considered AI-response traffic.
+ * @param {string} requestUrl
+ * @param {string} targetSite
+ * @returns {boolean}
+ */
+function isTrackableCaptureRequestUrl(requestUrl, targetSite) {
+  if (!requestUrl || typeof requestUrl !== 'string') {
+    return false;
+  }
+
+  try {
+    const parsed = new URL(requestUrl);
+    const hostname = parsed.hostname.toLowerCase();
+    const pathAndSearch = `${parsed.pathname}${parsed.search}`.toLowerCase();
+    const allowlist = getCaptureHostAllowlist(targetSite);
+    const hostMatched = allowlist.some((domain) => hostname === domain || hostname.endsWith(`.${domain}`));
+    if (!hostMatched) {
+      return false;
+    }
+
+    if (isKimiChatServiceUrl(parsed.toString())) {
+      return true;
+    }
+
+    return URL_KEYWORDS.some((keyword) => pathAndSearch.includes(keyword));
+  } catch (_error) {
+    return false;
+  }
+}
+
+/**
+ * Stops one webRequest tracking session and clears reverse indexes.
+ * @param {string} taskId
+ * @param {string} reason
+ */
+function stopWebRequestTrackingSession(taskId, reason) {
+  if (!taskId || typeof taskId !== 'string') {
+    return;
+  }
+
+  const session = webRequestTrackingSessionsByTaskId.get(taskId);
+  if (!session) {
+    return;
+  }
+
+  webRequestTrackingSessionsByTaskId.delete(taskId);
+  const indexedTaskId = webRequestTrackingTaskIdByTabId.get(session.tabId);
+  if (indexedTaskId === taskId) {
+    webRequestTrackingTaskIdByTabId.delete(session.tabId);
+  }
+
+  logInfo('Stopped webRequest capture tracking session.', {
+    taskId,
+    tabId: session.tabId,
+    targetSite: session.targetSite,
+    reason,
+    matchedRequestCount: session.matchedRequestCount,
+    completedRequestCount: session.completedRequestCount,
+    inflightCount: session.inflightRequestIds.size
+  });
+}
+
+/**
+ * Starts or replaces one webRequest tracking session.
+ * @param {string} taskId
+ * @param {number} tabId
+ * @param {string} targetSite
+ */
+function startWebRequestTrackingSession(taskId, tabId, targetSite) {
+  if (!taskId || !Number.isInteger(tabId)) {
+    return;
+  }
+
+  const oldTaskId = webRequestTrackingTaskIdByTabId.get(tabId);
+  if (oldTaskId && oldTaskId !== taskId) {
+    stopWebRequestTrackingSession(oldTaskId, 'replaced_by_new_task');
+  }
+  if (webRequestTrackingSessionsByTaskId.has(taskId)) {
+    stopWebRequestTrackingSession(taskId, 'restart');
+  }
+
+  const startedAt = Date.now();
+  webRequestTrackingSessionsByTaskId.set(taskId, {
+    taskId,
+    tabId,
+    targetSite: typeof targetSite === 'string' && targetSite ? targetSite : 'unknown',
+    startedAt,
+    lastActivityAt: startedAt,
+    matchedRequestCount: 0,
+    completedRequestCount: 0,
+    inflightRequestIds: new Set(),
+    requestUrlByRequestId: new Map(),
+    lastMatchedUrl: ''
+  });
+  webRequestTrackingTaskIdByTabId.set(tabId, taskId);
+
+  logInfo('Started webRequest capture tracking session.', {
+    taskId,
+    tabId,
+    targetSite: typeof targetSite === 'string' && targetSite ? targetSite : 'unknown'
+  });
+}
+
+/**
+ * Updates one active tracking session when request starts.
+ * @param {number} tabId
+ * @param {string} requestId
+ * @param {string} requestUrl
+ */
+function onTrackedRequestStarted(tabId, requestId, requestUrl) {
+  const taskId = webRequestTrackingTaskIdByTabId.get(tabId);
+  if (!taskId) {
+    return;
+  }
+
+  const session = webRequestTrackingSessionsByTaskId.get(taskId);
+  if (!session) {
+    return;
+  }
+
+  if (!isTrackableCaptureRequestUrl(requestUrl, session.targetSite)) {
+    return;
+  }
+
+  session.matchedRequestCount += 1;
+  session.lastActivityAt = Date.now();
+  session.lastMatchedUrl = requestUrl;
+  if (requestId) {
+    session.inflightRequestIds.add(requestId);
+    session.requestUrlByRequestId.set(requestId, requestUrl);
+  }
+
+  if (session.matchedRequestCount <= 5 || session.matchedRequestCount % 20 === 0) {
+    logInfo('webRequest matched request start.', {
+      taskId: session.taskId,
+      tabId: session.tabId,
+      targetSite: session.targetSite,
+      requestId,
+      matchedRequestCount: session.matchedRequestCount,
+      inflightCount: session.inflightRequestIds.size,
+      requestUrl
+    });
+  }
+}
+
+/**
+ * Updates one active tracking session when matched request completes or errors.
+ * @param {number} tabId
+ * @param {string} requestId
+ */
+function onTrackedRequestFinished(tabId, requestId) {
+  const taskId = webRequestTrackingTaskIdByTabId.get(tabId);
+  if (!taskId) {
+    return;
+  }
+
+  const session = webRequestTrackingSessionsByTaskId.get(taskId);
+  if (!session) {
+    return;
+  }
+
+  if (!requestId || !session.inflightRequestIds.has(requestId)) {
+    return;
+  }
+
+  session.inflightRequestIds.delete(requestId);
+  const requestUrl = session.requestUrlByRequestId.get(requestId) || '';
+  session.requestUrlByRequestId.delete(requestId);
+  session.completedRequestCount += 1;
+  session.lastActivityAt = Date.now();
+
+  if (session.completedRequestCount <= 5 || session.completedRequestCount % 20 === 0) {
+    logInfo('webRequest matched request finished.', {
+      taskId: session.taskId,
+      tabId: session.tabId,
+      targetSite: session.targetSite,
+      requestId,
+      completedRequestCount: session.completedRequestCount,
+      inflightCount: session.inflightRequestIds.size,
+      requestUrl
+    });
+  }
+}
+
+/**
+ * Waits until one task's tracked request stream becomes idle.
+ * @param {string} taskId
+ * @param {number} timeoutMs
+ * @returns {Promise<{ok:boolean,taskId:string,timedOut:boolean,matchedRequestCount:number,completedRequestCount:number,inflightCount:number,idleForMs:number,lastMatchedUrl:string}>}
+ */
+async function waitForWebRequestTrackingIdle(taskId, timeoutMs = CAPTURE_NETWORK_WAIT_TIMEOUT_MS) {
+  const normalizedTimeout =
+    Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0 ? Number(timeoutMs) : CAPTURE_NETWORK_WAIT_TIMEOUT_MS;
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt <= normalizedTimeout) {
+    const session = webRequestTrackingSessionsByTaskId.get(taskId);
+    if (!session) {
+      return {
+        ok: true,
+        taskId,
+        timedOut: false,
+        matchedRequestCount: 0,
+        completedRequestCount: 0,
+        inflightCount: 0,
+        idleForMs: 0,
+        lastMatchedUrl: ''
+      };
+    }
+
+    const idleForMs = Date.now() - session.lastActivityAt;
+    const inflightCount = session.inflightRequestIds.size;
+    const hasMatchedRequest = session.matchedRequestCount > 0;
+    const idleReached = inflightCount === 0 && idleForMs >= CAPTURE_NETWORK_IDLE_WINDOW_MS;
+    const noMatchGraceReached = !hasMatchedRequest && Date.now() - session.startedAt >= CAPTURE_NETWORK_IDLE_WINDOW_MS;
+    if (idleReached || noMatchGraceReached) {
+      return {
+        ok: true,
+        taskId,
+        timedOut: false,
+        matchedRequestCount: session.matchedRequestCount,
+        completedRequestCount: session.completedRequestCount,
+        inflightCount,
+        idleForMs,
+        lastMatchedUrl: session.lastMatchedUrl
+      };
+    }
+
+    await waitMs(CAPTURE_NETWORK_WAIT_POLL_MS);
+  }
+
+  const finalSession = webRequestTrackingSessionsByTaskId.get(taskId);
+  return {
+    ok: false,
+    taskId,
+    timedOut: true,
+    matchedRequestCount: finalSession ? finalSession.matchedRequestCount : 0,
+    completedRequestCount: finalSession ? finalSession.completedRequestCount : 0,
+    inflightCount: finalSession ? finalSession.inflightRequestIds.size : 0,
+    idleForMs: finalSession ? Date.now() - finalSession.lastActivityAt : 0,
+    lastMatchedUrl: finalSession ? finalSession.lastMatchedUrl : ''
+  };
+}
+
+/**
+ * Handles webRequest start event to track candidate AI traffic per task.
+ * @param {chrome.webRequest.WebRequestBodyDetails} details
+ */
+function handleWebRequestBeforeRequest(details) {
+  const tabId = Number(details?.tabId);
+  if (!Number.isInteger(tabId) || tabId < 0) {
+    return;
+  }
+
+  onTrackedRequestStarted(
+    tabId,
+    typeof details?.requestId === 'string' ? details.requestId : '',
+    typeof details?.url === 'string' ? details.url : ''
+  );
+}
+
+/**
+ * Handles webRequest completion/error events to close inflight request ids.
+ * @param {chrome.webRequest.WebResponseCacheDetails} details
+ */
+function handleWebRequestFinished(details) {
+  const tabId = Number(details?.tabId);
+  if (!Number.isInteger(tabId) || tabId < 0) {
+    return;
+  }
+
+  onTrackedRequestFinished(tabId, typeof details?.requestId === 'string' ? details.requestId : '');
+}
+
+/**
+ * Decodes base64 payload to UTF-8 text when debugger returns encoded body.
+ * @param {string} base64Text
+ * @returns {string}
+ */
+function decodeBase64ToUtf8(base64Text) {
+  try {
+    const binary = atob(base64Text);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return new TextDecoder().decode(bytes);
+  } catch (_error) {
+    return '';
+  }
+}
+
+/**
+ * Determines whether one JSON path may contain assistant text.
+ * @param {string} path
+ * @returns {boolean}
+ */
+function shouldCollectJsonTextField(path) {
+  const lowerPath = path.toLowerCase();
+  if (!CAPTURE_TEXT_FIELD_HINTS.some((hint) => lowerPath.includes(hint))) {
+    return false;
+  }
+
+  return !CAPTURE_TEXT_IGNORE_HINTS.some((hint) => lowerPath.endsWith(hint) || lowerPath.includes(`.${hint}.`));
+}
+
+/**
+ * Recursively collects text fragments from parsed JSON payload.
+ * @param {unknown} value
+ * @param {string} path
+ * @param {string[]} output
+ * @param {number} depth
+ */
+function collectJsonTextFragments(value, path, output, depth = 0) {
+  if (depth > 10 || value === null || value === undefined) {
+    return;
+  }
+
+  if (typeof value === 'string') {
+    if (path && shouldCollectJsonTextField(path) && value.trim()) {
+      output.push(value);
+    }
+    return;
+  }
+
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index += 1) {
+      collectJsonTextFragments(value[index], path ? `${path}[${index}]` : `[${index}]`, output, depth + 1);
+    }
+    return;
+  }
+
+  if (typeof value === 'object') {
+    const role = typeof value.role === 'string' ? value.role.trim().toLowerCase() : '';
+    if (role && role !== 'assistant' && role !== 'model') {
+      return;
+    }
+
+    for (const [key, child] of Object.entries(value)) {
+      collectJsonTextFragments(child, path ? `${path}.${key}` : key, output, depth + 1);
+    }
+  }
+}
+
+/**
+ * Extracts valid JSON payloads from mixed framed stream text.
+ * @param {string} raw
+ * @returns {Array<unknown>}
+ */
+function extractJsonPayloadsFromRaw(raw) {
+  const payloads = [];
+  const text = String(raw || '');
+  if (!text) {
+    return payloads;
+  }
+
+  let startIndex = -1;
+  let stack = [];
+  let inString = false;
+  let escaped = false;
+
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (startIndex === -1) {
+      if (char === '{') {
+        startIndex = index;
+        stack = ['}'];
+        inString = false;
+        escaped = false;
+      } else if (char === '[') {
+        startIndex = index;
+        stack = [']'];
+        inString = false;
+        escaped = false;
+      }
+      continue;
+    }
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+    if (char === '{') {
+      stack.push('}');
+      continue;
+    }
+    if (char === '[') {
+      stack.push(']');
+      continue;
+    }
+
+    if (stack.length > 0 && char === stack[stack.length - 1]) {
+      stack.pop();
+      if (stack.length === 0) {
+        const candidate = text.slice(startIndex, index + 1);
+        startIndex = -1;
+        if (!candidate || candidate.length > 2 * 1024 * 1024) {
+          continue;
+        }
+
+        try {
+          payloads.push(JSON.parse(candidate));
+        } catch (_error) {
+          // Ignore malformed non-JSON candidate fragments.
+        }
+      }
+    }
+  }
+
+  return payloads;
+}
+
+/**
+ * Extracts assistant-like text from connect+json response body.
+ * @param {string} rawBody
+ * @returns {string}
+ */
+function extractReadableTextFromConnectBody(rawBody) {
+  const payloads = extractJsonPayloadsFromRaw(rawBody);
+  if (payloads.length === 0) {
+    return '';
+  }
+
+  const fragments = [];
+  for (const payload of payloads) {
+    collectJsonTextFragments(payload, '', fragments);
+  }
+
+  return fragments.join('').replace(/\r/g, '').replace(/[ \t]{2,}/g, ' ').trim();
+}
+
+/**
+ * Clears one debugger capture session and detaches debugger from target tab.
+ * @param {number} tabId
+ * @param {string} reason
+ */
+async function stopDebuggerCaptureSession(tabId, reason) {
+  const session = debuggerCaptureSessionsByTabId.get(tabId);
+  if (!session) {
+    return;
+  }
+
+  if (session.timeoutHandle !== null) {
+    clearTimeout(session.timeoutHandle);
+  }
+  debuggerCaptureSessionsByTabId.delete(tabId);
+
+  try {
+    await detachDebugger({ tabId });
+  } catch (error) {
+    logInfo('Debugger detach skipped or failed.', {
+      tabId,
+      taskId: session.taskId,
+      reason,
+      error: String(error)
+    });
+    return;
+  }
+
+  logInfo('Debugger capture session closed.', {
+    tabId,
+    taskId: session.taskId,
+    reason
+  });
+}
+
+/**
+ * Stores debugger-captured response text for task fallback replacement.
+ * @param {string} taskId
+ * @param {string} responseText
+ * @param {string} captureSourceUrl
+ * @param {number} bodyLength
+ */
+function saveDebuggerCapturedResponse(taskId, responseText, captureSourceUrl, bodyLength) {
+  if (!taskId || !responseText) {
+    return;
+  }
+
+  const capture = {
+    taskId,
+    responseText,
+    captureSourceUrl: captureSourceUrl || '',
+    capturedAt: new Date().toISOString(),
+    bodyLength
+  };
+  debuggerCapturedByTaskId.set(taskId, capture);
+
+  setTimeout(() => {
+    const current = debuggerCapturedByTaskId.get(taskId);
+    if (current && current.capturedAt === capture.capturedAt) {
+      debuggerCapturedByTaskId.delete(taskId);
+    }
+  }, DEBUGGER_CAPTURE_RETENTION_MS);
+}
+
+/**
+ * Gets and consumes debugger capture fallback for one task.
+ * @param {string} taskId
+ * @returns {{taskId:string,responseText:string,captureSourceUrl:string,capturedAt:string,bodyLength:number}|null}
+ */
+function takeDebuggerCapturedResponse(taskId) {
+  if (!taskId) {
+    return null;
+  }
+
+  const capture = debuggerCapturedByTaskId.get(taskId) || null;
+  if (capture) {
+    debuggerCapturedByTaskId.delete(taskId);
+  }
+  return capture;
+}
+
+/**
+ * Reads debugger capture fallback for one task without consuming it.
+ * @param {string} taskId
+ * @returns {{taskId:string,responseText:string,captureSourceUrl:string,capturedAt:string,bodyLength:number}|null}
+ */
+function peekDebuggerCapturedResponse(taskId) {
+  if (!taskId) {
+    return null;
+  }
+
+  return debuggerCapturedByTaskId.get(taskId) || null;
+}
+
+/**
+ * Waits a short window for debugger capture to arrive for one task.
+ * @param {string} taskId
+ * @param {number} timeoutMs
+ * @returns {Promise<{taskId:string,responseText:string,captureSourceUrl:string,capturedAt:string,bodyLength:number}|null>}
+ */
+async function waitForDebuggerCapturedResponse(taskId, timeoutMs = DEBUGGER_CAPTURE_WAIT_TIMEOUT_MS) {
+  if (!taskId || timeoutMs <= 0) {
+    return null;
+  }
+
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const capture = peekDebuggerCapturedResponse(taskId);
+    if (capture && capture.responseText) {
+      return capture;
+    }
+    await waitMs(DEBUGGER_CAPTURE_WAIT_POLL_MS);
+  }
+
+  return peekDebuggerCapturedResponse(taskId);
+}
+
+/**
+ * Processes one matching debugger request completion and extracts response text.
+ * @param {number} tabId
+ * @param {string} requestId
+ */
+async function handleDebuggerRequestCompleted(tabId, requestId) {
+  const session = debuggerCaptureSessionsByTabId.get(tabId);
+  if (!session || session.completed || !session.requestIds.has(requestId)) {
+    return;
+  }
+
+  session.completed = true;
+  let bodyText = '';
+  let captureSourceUrl = session.requestUrl || '';
+  try {
+    const result = await sendDebuggerCommand({ tabId }, 'Network.getResponseBody', { requestId });
+    const rawBody = typeof result.body === 'string' ? result.body : '';
+    bodyText = result.base64Encoded === true ? decodeBase64ToUtf8(rawBody) : rawBody;
+    const responseText = extractReadableTextFromConnectBody(bodyText);
+    if (responseText) {
+      saveDebuggerCapturedResponse(session.taskId, responseText, captureSourceUrl, bodyText.length);
+      logInfo('Debugger capture extracted Kimi response.', {
+        tabId,
+        taskId: session.taskId,
+        responseLength: responseText.length,
+        bodyLength: bodyText.length,
+        captureSourceUrl
+      });
+    } else {
+      logInfo('Debugger capture received body but no readable text extracted.', {
+        tabId,
+        taskId: session.taskId,
+        bodyLength: bodyText.length,
+        captureSourceUrl
+      });
+    }
+  } catch (error) {
+    console.error('Failed to parse debugger response body:', {
+      tabId,
+      taskId: session.taskId,
+      requestId,
+      error: String(error)
+    });
+  } finally {
+    await stopDebuggerCaptureSession(tabId, 'request_completed');
+  }
+}
+
+/**
+ * Handles debugger network events and routes Kimi chat service traffic to fallback capture.
+ * @param {chrome.debugger.Debuggee} source
+ * @param {string} method
+ * @param {Record<string, unknown>} params
+ */
+function handleDebuggerEvent(source, method, params) {
+  const tabId = Number(source?.tabId);
+  if (!Number.isInteger(tabId)) {
+    return;
+  }
+
+  const session = debuggerCaptureSessionsByTabId.get(tabId);
+  if (!session) {
+    return;
+  }
+
+  if (method === 'Network.requestWillBeSent') {
+    const requestId = typeof params?.requestId === 'string' ? params.requestId : '';
+    const url = typeof params?.request?.url === 'string' ? params.request.url : '';
+    if (!requestId || !isKimiChatServiceUrl(url)) {
+      return;
+    }
+
+    session.requestIds.add(requestId);
+    session.requestUrl = url;
+    logInfo('Debugger matched Kimi chat request.', {
+      tabId,
+      taskId: session.taskId,
+      requestId,
+      url
+    });
+    return;
+  }
+
+  if (method === 'Network.loadingFinished') {
+    const requestId = typeof params?.requestId === 'string' ? params.requestId : '';
+    if (!requestId || !session.requestIds.has(requestId)) {
+      return;
+    }
+    handleDebuggerRequestCompleted(tabId, requestId).catch((error) => {
+      console.error('Failed handling debugger loadingFinished event:', error);
+    });
+  }
+}
+
+/**
+ * Handles debugger detach events so stale sessions are cleaned up.
+ * @param {chrome.debugger.Debuggee} source
+ * @param {string} reason
+ */
+function handleDebuggerDetach(source, reason) {
+  const tabId = Number(source?.tabId);
+  if (!Number.isInteger(tabId)) {
+    return;
+  }
+
+  const session = debuggerCaptureSessionsByTabId.get(tabId);
+  if (!session) {
+    return;
+  }
+
+  if (session.timeoutHandle !== null) {
+    clearTimeout(session.timeoutHandle);
+  }
+  debuggerCaptureSessionsByTabId.delete(tabId);
+  logInfo('Debugger capture session detached.', {
+    tabId,
+    taskId: session.taskId,
+    reason
+  });
+}
+
+/**
+ * Ensures debugger event listeners are registered once.
+ */
+function ensureDebuggerListenersInstalled() {
+  if (debuggerListenersInstalled) {
+    return;
+  }
+
+  debuggerListenersInstalled = true;
+  chrome.debugger.onEvent.addListener(handleDebuggerEvent);
+  chrome.debugger.onDetach.addListener(handleDebuggerDetach);
+}
+
+/**
+ * Starts one Kimi-specific debugger capture session for fallback response extraction.
+ * @param {number} tabId
+ * @param {{taskId:string}} taskContext
+ * @param {string} targetSite
+ */
+async function startDebuggerCaptureForTask(tabId, taskContext, targetSite) {
+  if (!Number.isInteger(tabId) || targetSite !== 'kimi') {
+    return;
+  }
+  if (!taskContext || typeof taskContext.taskId !== 'string' || !taskContext.taskId) {
+    return;
+  }
+  if (!chrome.debugger || typeof chrome.debugger.attach !== 'function') {
+    return;
+  }
+
+  ensureDebuggerListenersInstalled();
+
+  if (debuggerCaptureSessionsByTabId.has(tabId)) {
+    await stopDebuggerCaptureSession(tabId, 'replaced');
+  }
+
+  try {
+    await attachDebugger({ tabId });
+  } catch (error) {
+    console.error('Failed to attach debugger for Kimi capture.', {
+      tabId,
+      taskId: taskContext.taskId,
+      error: String(error)
+    });
+    return;
+  }
+
+  try {
+    await sendDebuggerCommand({ tabId }, 'Network.enable');
+  } catch (error) {
+    console.error('Failed to enable debugger Network domain.', {
+      tabId,
+      taskId: taskContext.taskId,
+      error: String(error)
+    });
+    await stopDebuggerCaptureSession(tabId, 'network_enable_failed');
+    return;
+  }
+
+  const timeoutHandle = setTimeout(() => {
+    stopDebuggerCaptureSession(tabId, 'timeout').catch((error) => {
+      console.error('Failed to stop debugger session on timeout:', error);
+    });
+  }, DEBUGGER_CAPTURE_TIMEOUT_MS);
+
+  debuggerCaptureSessionsByTabId.set(tabId, {
+    tabId,
+    taskId: taskContext.taskId,
+    targetSite,
+    startedAt: Date.now(),
+    requestIds: new Set(),
+    requestUrl: '',
+    completed: false,
+    timeoutHandle
+  });
+
+  logInfo('Debugger capture session started.', {
+    tabId,
+    taskId: taskContext.taskId,
+    targetSite
   });
 }
 
@@ -312,7 +1257,7 @@ async function loadSyncTargetSettings() {
 
 /**
  * Loads retry queue from current schema key.
- * @returns {Promise<Array<{id:string,payload:{taskId:string,targetSite:string,sourceUrl:string,sourceTitle:string,aiResponse:string,capturedAt:string,captureMethod:string,captureChannel:string,captureSourceUrl:string,captureChunkCount:number,captureDurationMs:number},providerId:string,attempts:number,lastError:string,updatedAt:string}>>}
+ * @returns {Promise<Array<{id:string,payload:{taskId:string,targetSite:string,sourceUrl:string,sourceTitle:string,aiResponse:string,capturedAt:string,captureMethod:string,captureChannel:string,captureSourceUrl:string,captureChunkCount:number,captureDurationMs:number,captureDump:string},providerId:string,attempts:number,lastError:string,updatedAt:string}>>}
  */
 async function loadSyncRetryQueue() {
   try {
@@ -330,7 +1275,7 @@ async function loadSyncRetryQueue() {
 
 /**
  * Saves sync retry queue into extension storage.
- * @param {Array<{id:string,payload:{taskId:string,targetSite:string,sourceUrl:string,sourceTitle:string,aiResponse:string,capturedAt:string,captureMethod:string,captureChannel:string,captureSourceUrl:string,captureChunkCount:number,captureDurationMs:number},providerId:string,attempts:number,lastError:string,updatedAt:string}>} queue
+ * @param {Array<{id:string,payload:{taskId:string,targetSite:string,sourceUrl:string,sourceTitle:string,aiResponse:string,capturedAt:string,captureMethod:string,captureChannel:string,captureSourceUrl:string,captureChunkCount:number,captureDurationMs:number,captureDump:string},providerId:string,attempts:number,lastError:string,updatedAt:string}>} queue
  */
 async function saveSyncRetryQueue(queue) {
   try {
@@ -435,6 +1380,11 @@ function buildTargetUrl(targetConfig, finalText, taskContext) {
       url.searchParams.set(SOURCE_TITLE_PARAM, safeTitle);
     }
 
+    // Keep dump enabled in this debug phase to collect full observed streams.
+    if (ENABLE_CAPTURE_DUMP_QUERY) {
+      url.searchParams.set(CAPTURE_DUMP_PARAM, '1');
+    }
+
     return url.toString();
   } catch (error) {
     console.error('Failed to build target URL with prompt payload:', error);
@@ -496,8 +1446,8 @@ function buildProviderCredentialError(providerId) {
 
 /**
  * Normalizes one AI response report payload before syncing.
- * @param {{taskId?: string, targetSite?: string, sourceUrl?: string, sourceTitle?: string, aiResponse?: string, capturedAt?: string, captureMethod?: string, captureChannel?: string, captureSourceUrl?: string, captureChunkCount?: number|string, captureDurationMs?: number|string}} message
- * @returns {{taskId: string, targetSite: string, sourceUrl: string, sourceTitle: string, aiResponse: string, capturedAt: string, captureMethod: string, captureChannel: string, captureSourceUrl: string, captureChunkCount: number, captureDurationMs: number}}
+ * @param {{taskId?: string, targetSite?: string, sourceUrl?: string, sourceTitle?: string, aiResponse?: string, capturedAt?: string, captureMethod?: string, captureChannel?: string, captureSourceUrl?: string, captureChunkCount?: number|string, captureDurationMs?: number|string, captureDump?: string}} message
+ * @returns {{taskId: string, targetSite: string, sourceUrl: string, sourceTitle: string, aiResponse: string, capturedAt: string, captureMethod: string, captureChannel: string, captureSourceUrl: string, captureChunkCount: number, captureDurationMs: number, captureDump: string}}
  */
 function normalizeAiResponsePayload(message) {
   const taskId = typeof message.taskId === 'string' ? message.taskId.trim() : '';
@@ -534,6 +1484,7 @@ function normalizeAiResponsePayload(message) {
     Number.isFinite(captureChunkCountValue) && captureChunkCountValue >= 0 ? captureChunkCountValue : 0;
   const captureDurationMs =
     Number.isFinite(captureDurationMsValue) && captureDurationMsValue >= 0 ? captureDurationMsValue : 0;
+  const captureDump = typeof message.captureDump === 'string' ? message.captureDump : '';
 
   return {
     taskId,
@@ -546,7 +1497,8 @@ function normalizeAiResponsePayload(message) {
     captureChannel,
     captureSourceUrl,
     captureChunkCount,
-    captureDurationMs
+    captureDurationMs,
+    captureDump
   };
 }
 
@@ -578,7 +1530,7 @@ function getObsidianProvider() {
 
 /**
  * Dispatches sync payload to active provider implementation.
- * @param {{taskId: string, targetSite: string, sourceUrl: string, sourceTitle: string, aiResponse: string, capturedAt: string, captureMethod: string, captureChannel: string, captureSourceUrl: string, captureChunkCount: number, captureDurationMs: number}} payload
+ * @param {{taskId: string, targetSite: string, sourceUrl: string, sourceTitle: string, aiResponse: string, capturedAt: string, captureMethod: string, captureChannel: string, captureSourceUrl: string, captureChunkCount: number, captureDurationMs: number, captureDump: string}} payload
  * @param {{provider:string,webhookUrl:string,webhookAuthToken:string,obsidianBaseUrl:string,obsidianApiKey:string}} settings
  * @param {string} providerId
  */
@@ -604,7 +1556,7 @@ async function syncPayloadToProvider(payload, settings, providerId) {
 
 /**
  * Adds one failed payload into local retry queue.
- * @param {{taskId: string, targetSite: string, sourceUrl: string, sourceTitle: string, aiResponse: string, capturedAt: string, captureMethod: string, captureChannel: string, captureSourceUrl: string, captureChunkCount: number, captureDurationMs: number}} payload
+ * @param {{taskId: string, targetSite: string, sourceUrl: string, sourceTitle: string, aiResponse: string, capturedAt: string, captureMethod: string, captureChannel: string, captureSourceUrl: string, captureChunkCount: number, captureDurationMs: number, captureDump: string}} payload
  * @param {string} providerId
  * @param {string} lastError
  */
@@ -712,11 +1664,12 @@ async function retryQueuedSync() {
 
 /**
  * Handles one AI response report from content scripts.
- * @param {{taskId?: string, targetSite?: string, sourceUrl?: string, sourceTitle?: string, aiResponse?: string, capturedAt?: string, captureMethod?: string, captureChannel?: string, captureSourceUrl?: string, captureChunkCount?: number|string, captureDurationMs?: number|string}} message
+ * @param {{taskId?: string, targetSite?: string, sourceUrl?: string, sourceTitle?: string, aiResponse?: string, capturedAt?: string, captureMethod?: string, captureChannel?: string, captureSourceUrl?: string, captureChunkCount?: number|string, captureDurationMs?: number|string, captureDump?: string}} message
  * @returns {Promise<{ok: boolean, queued?: boolean, skipped?: boolean, error?: string}>}
  */
 async function handleAiResponseReport(message) {
   const payload = normalizeAiResponsePayload(message);
+  stopWebRequestTrackingSession(payload.taskId, 'report_received');
   const syncSettings = await loadSyncTargetSettings();
   const providerId = resolveActiveProvider(syncSettings);
 
@@ -733,7 +1686,8 @@ async function handleAiResponseReport(message) {
     captureChannel: payload.captureChannel,
     captureSourceUrl: payload.captureSourceUrl || null,
     captureChunkCount: payload.captureChunkCount,
-    captureDurationMs: payload.captureDurationMs
+    captureDurationMs: payload.captureDurationMs,
+    captureDumpLength: payload.captureDump.length
   });
 
   if (!syncSettings.autoSync || providerId === SYNC_PROVIDER_IDS.DISABLED) {
@@ -772,7 +1726,8 @@ async function handleAiResponseReport(message) {
       targetSite: payload.targetSite,
       captureMethod: payload.captureMethod,
       captureChannel: payload.captureChannel,
-      captureChunkCount: payload.captureChunkCount
+      captureChunkCount: payload.captureChunkCount,
+      captureDumpLength: payload.captureDump.length
     });
     return { ok: true };
   } catch (error) {
@@ -789,50 +1744,6 @@ async function handleAiResponseReport(message) {
 
     return { ok: false, error: String(error) };
   }
-}
-
-/**
- * Injects main-world response capture script into one tab with retry.
- * @param {number} tabId
- * @returns {Promise<boolean>}
- */
-async function ensureMainWorldCaptureInjected(tabId) {
-  if (!Number.isInteger(tabId)) {
-    console.error('Invalid tab id for main-world capture injection:', tabId);
-    return false;
-  }
-
-  if (!chrome.scripting || typeof chrome.scripting.executeScript !== 'function') {
-    console.error('chrome.scripting API is unavailable for main-world capture injection.');
-    return false;
-  }
-
-  for (let attempt = 1; attempt <= CAPTURE_INJECTION_MAX_ATTEMPTS; attempt += 1) {
-    try {
-      await chrome.scripting.executeScript({
-        target: { tabId },
-        world: 'MAIN',
-        files: ['response-capture-main.js']
-      });
-      logInfo('Main-world response capture script injected.', {
-        tabId,
-        attempt
-      });
-      return true;
-    } catch (error) {
-      console.error('Failed to inject main-world response capture script.', {
-        tabId,
-        attempt,
-        error: String(error)
-      });
-
-      if (attempt < CAPTURE_INJECTION_MAX_ATTEMPTS) {
-        await waitMs(CAPTURE_INJECTION_RETRY_DELAY_MS);
-      }
-    }
-  }
-
-  return false;
 }
 
 /**
@@ -902,15 +1813,6 @@ function attachTaskDeliveryListener(targetSite, targetName, tabId, finalText, ta
       taskId: taskContext.taskId
     });
     chrome.tabs.onUpdated.removeListener(handleTabUpdated);
-
-    const injected = await ensureMainWorldCaptureInjected(tabId);
-    if (!injected) {
-      console.error('Proceeding without main-world capture injection. Content capture may fail.', {
-        tabId,
-        targetSite,
-        taskId: taskContext.taskId
-      });
-    }
 
     sendTaskMessageToTab(tabId, targetSite, finalText, taskContext);
   };
@@ -1093,9 +1995,60 @@ chrome.commands.onCommand.addListener(async (command) => {
 /**
  * Receives AI response capture results from content scripts.
  */
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || typeof message.action !== 'string') {
     return;
+  }
+
+  if (message.action === CAPTURE_NETWORK_TRACK_START_ACTION) {
+    const tabId = Number(sender?.tab?.id);
+    const taskId = typeof message.taskId === 'string' ? message.taskId.trim() : '';
+    const targetSite = typeof message.targetSite === 'string' ? message.targetSite.trim() : 'unknown';
+    if (!taskId || !Number.isInteger(tabId)) {
+      sendResponse({ ok: false, error: 'Invalid taskId or sender tab id for network tracking start.' });
+      return;
+    }
+
+    startWebRequestTrackingSession(taskId, tabId, targetSite);
+    sendResponse({ ok: true, taskId, tabId, targetSite });
+    return;
+  }
+
+  if (message.action === CAPTURE_NETWORK_TRACK_STOP_ACTION) {
+    const taskId = typeof message.taskId === 'string' ? message.taskId.trim() : '';
+    const reason = typeof message.reason === 'string' ? message.reason.trim() : 'content_stop';
+    if (!taskId) {
+      sendResponse({ ok: false, error: 'Missing taskId for network tracking stop.' });
+      return;
+    }
+
+    stopWebRequestTrackingSession(taskId, reason || 'content_stop');
+    sendResponse({ ok: true, taskId });
+    return;
+  }
+
+  if (message.action === CAPTURE_NETWORK_WAIT_IDLE_ACTION) {
+    const taskId = typeof message.taskId === 'string' ? message.taskId.trim() : '';
+    const timeoutMs = Number(message.timeoutMs);
+    if (!taskId) {
+      sendResponse({ ok: false, error: 'Missing taskId for network idle wait.' });
+      return;
+    }
+
+    waitForWebRequestTrackingIdle(taskId, timeoutMs)
+      .then((status) => {
+        sendResponse(status);
+      })
+      .catch((error) => {
+        sendResponse({
+          ok: false,
+          taskId,
+          timedOut: false,
+          error: String(error)
+        });
+      });
+
+    return true;
   }
 
   if (message.action === AI_RESPONSE_REPORT_ACTION) {
@@ -1153,6 +2106,23 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
     console.error('Failed to retry queue after sync settings changed:', error);
   });
 });
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  const taskId = webRequestTrackingTaskIdByTabId.get(tabId);
+  if (!taskId) {
+    return;
+  }
+
+  stopWebRequestTrackingSession(taskId, 'tab_removed');
+});
+
+if (chrome.webRequest) {
+  chrome.webRequest.onBeforeRequest.addListener(handleWebRequestBeforeRequest, { urls: ['<all_urls>'] });
+  chrome.webRequest.onCompleted.addListener(handleWebRequestFinished, { urls: ['<all_urls>'] });
+  chrome.webRequest.onErrorOccurred.addListener(handleWebRequestFinished, { urls: ['<all_urls>'] });
+} else {
+  console.error('chrome.webRequest API is unavailable. Network idle gate will be skipped.');
+}
 
 logRegisteredCommands();
 scheduleSyncRetryAlarm().catch((error) => {

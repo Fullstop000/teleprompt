@@ -3,8 +3,12 @@ const TASK_PARAM = 'omnistitch_task';
 const PROMPT_PARAM = 'q';
 const SOURCE_URL_PARAM = 'omnistitch_source';
 const SOURCE_TITLE_PARAM = 'omnistitch_title';
+const CAPTURE_DUMP_PARAM = 'omnistitch_capture_dump';
 const MESSAGE_ACTION = 'omnistitch_auto_send';
 const AI_RESPONSE_REPORT_ACTION = 'omnistitch_ai_response_report';
+const CAPTURE_NETWORK_TRACK_START_ACTION = 'omnistitch_capture_network_track_start';
+const CAPTURE_NETWORK_TRACK_STOP_ACTION = 'omnistitch_capture_network_track_stop';
+const CAPTURE_NETWORK_WAIT_IDLE_ACTION = 'omnistitch_capture_network_wait_idle';
 const MAX_WAIT_MS = 30000;
 const POLL_INTERVAL_MS = 250;
 const DEDUPE_WINDOW_MS = 15000;
@@ -13,6 +17,8 @@ const MIN_RESPONSE_TEXT_LENGTH = 20;
 const RESPONSE_LOG_PREVIEW_LENGTH = 100;
 const CAPTURE_ACK_TIMEOUT_MS = 2000;
 const CAPTURE_HARD_TIMEOUT_MS = 185000;
+const CAPTURE_DUMP_FLUSH_TIMEOUT_MS = 25000;
+const CAPTURE_NETWORK_IDLE_WAIT_TIMEOUT_MS = 7000;
 const CAPTURE_MAIN_EVENT_SOURCE = 'omnistitch_capture_main';
 const CAPTURE_CONTENT_EVENT_SOURCE = 'omnistitch_capture_content';
 const CAPTURE_EVENT_TYPES = {
@@ -20,16 +26,20 @@ const CAPTURE_EVENT_TYPES = {
   STOP: 'OMNISTITCH_CAPTURE_STOP',
   READY: 'OMNISTITCH_CAPTURE_READY',
   ACK: 'OMNISTITCH_CAPTURE_ACK',
+  OBSERVED: 'OMNISTITCH_CAPTURE_OBSERVED',
   CHUNK: 'OMNISTITCH_CAPTURE_CHUNK',
   STREAM_END: 'OMNISTITCH_CAPTURE_STREAM_END',
   FINAL: 'OMNISTITCH_CAPTURE_FINAL',
   ERROR: 'OMNISTITCH_CAPTURE_ERROR'
 };
 const CONTENT_LOG_PREFIX = '[omnistitch][content]';
+const CAPTURE_DUMP_MAX_EVENTS = 10000;
 const TARGET_SITE_ADAPTERS = [
   {
     id: 'chatgpt',
     name: 'ChatGPT',
+    responseExtractor: extractChatgptResponseText,
+    modeSwitcher: switchChatgptMode,
     hostnames: ['chatgpt.com', 'chat.openai.com'],
     composerSelectors: [
       'textarea#prompt-textarea',
@@ -49,6 +59,8 @@ const TARGET_SITE_ADAPTERS = [
   {
     id: 'kimi',
     name: 'Kimi',
+    responseExtractor: extractKimiResponseText,
+    modeSwitcher: switchKimiMode,
     hostnames: ['kimi.com', 'www.kimi.com'],
     composerSelectors: [
       'div.chat-input-editor[contenteditable="true"]',
@@ -69,6 +81,8 @@ const TARGET_SITE_ADAPTERS = [
   {
     id: 'deepseek',
     name: 'DeepSeek',
+    responseExtractor: extractDeepseekResponseText,
+    modeSwitcher: switchDeepseekMode,
     hostnames: ['chat.deepseek.com'],
     composerSelectors: [
       'textarea[placeholder*="给 DeepSeek 发送消息"]',
@@ -94,6 +108,8 @@ const TARGET_SITE_ADAPTERS = [
   {
     id: 'gemini',
     name: 'Gemini',
+    responseExtractor: extractGeminiResponseText,
+    modeSwitcher: switchGeminiMode,
     hostnames: ['gemini.google.com'],
     composerSelectors: [
       'div.ql-editor.textarea[contenteditable="true"]',
@@ -167,8 +183,652 @@ async function sendRuntimeMessage(payload) {
 }
 
 /**
+ * Waits for background webRequest tracker to reach idle state for this task.
+ * Network status is advisory and never blocks reporting indefinitely.
+ * @param {string} taskId
+ * @returns {Promise<void>}
+ */
+async function waitForBackgroundNetworkIdle(taskId) {
+  if (!taskId) {
+    return;
+  }
+
+  try {
+    const status = await sendRuntimeMessage({
+      action: CAPTURE_NETWORK_WAIT_IDLE_ACTION,
+      taskId,
+      timeoutMs: CAPTURE_NETWORK_IDLE_WAIT_TIMEOUT_MS
+    });
+    logInfo('Background network idle gate finished.', {
+      taskId,
+      status: status || null
+    });
+  } catch (error) {
+    console.error('Failed to wait for background network idle gate:', error);
+  }
+}
+
+/**
+ * Normalizes one mode switch result to stable shape for logging.
+ * @param {unknown} result
+ * @param {string} fallbackDetail
+ * @returns {{applied:boolean,detail:string,preview:string}}
+ */
+function normalizeModeSwitchResult(result, fallbackDetail) {
+  if (!result || typeof result !== 'object') {
+    return {
+      applied: false,
+      detail: fallbackDetail,
+      preview: ''
+    };
+  }
+
+  return {
+    applied: result.applied === true,
+    detail: typeof result.detail === 'string' && result.detail.trim() ? result.detail.trim() : fallbackDetail,
+    preview: typeof result.preview === 'string' ? result.preview.trim() : ''
+  };
+}
+
+/**
+ * Checks whether one HTMLElement is visible to users.
+ * @param {HTMLElement} element
+ * @returns {boolean}
+ */
+function isVisibleElement(element) {
+  if (!(element instanceof HTMLElement)) {
+    return false;
+  }
+
+  if (element.offsetParent !== null) {
+    return true;
+  }
+
+  const style = window.getComputedStyle(element);
+  if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+    return false;
+  }
+
+  const rect = element.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
+}
+
+/**
+ * Reads one UI control text for mode switching heuristics.
+ * @param {HTMLElement} element
+ * @returns {string}
+ */
+function readModeControlText(element) {
+  if (!(element instanceof HTMLElement)) {
+    return '';
+  }
+
+  return normalizeCapturedText(
+    element.innerText || element.textContent || element.getAttribute('aria-label') || element.getAttribute('title') || ''
+  );
+}
+
+/**
+ * Checks whether one UI control currently looks active.
+ * @param {HTMLElement} element
+ * @returns {boolean}
+ */
+function isActiveModeControl(element) {
+  if (!(element instanceof HTMLElement)) {
+    return false;
+  }
+
+  const ariaPressed = String(element.getAttribute('aria-pressed') || '').toLowerCase();
+  const ariaChecked = String(element.getAttribute('aria-checked') || '').toLowerCase();
+  const className = String(element.className || '').toLowerCase();
+  return (
+    ariaPressed === 'true' ||
+    ariaChecked === 'true' ||
+    /active|selected|checked|enabled|on|current/.test(className)
+  );
+}
+
+/**
+ * Finds visible clickable controls for per-site mode switching.
+ * @returns {HTMLElement[]}
+ */
+function collectModeControls() {
+  const selectors = ['button', '[role="button"]', 'div[role="button"]'];
+  const controls = [];
+  for (const selector of selectors) {
+    const elements = Array.from(document.querySelectorAll(selector));
+    for (const element of elements) {
+      if (!(element instanceof HTMLElement)) {
+        continue;
+      }
+
+      if (!isVisibleElement(element)) {
+        continue;
+      }
+
+      controls.push(element);
+    }
+  }
+
+  return controls;
+}
+
+/**
+ * Clicks one control when it is enabled and interactable.
+ * @param {HTMLElement} element
+ * @returns {boolean}
+ */
+function clickModeControl(element) {
+  if (!(element instanceof HTMLElement)) {
+    return false;
+  }
+
+  if (element instanceof HTMLButtonElement && element.disabled) {
+    return false;
+  }
+
+  if (window.getComputedStyle(element).pointerEvents === 'none') {
+    return false;
+  }
+
+  element.click();
+  return true;
+}
+
+/**
+ * Keeps current mode for ChatGPT and reports no-op.
+ * @returns {Promise<{applied:boolean,detail:string,preview:string}>}
+ */
+async function switchChatgptMode() {
+  return {
+    applied: true,
+    detail: 'chatgpt mode unchanged',
+    preview: ''
+  };
+}
+
+/**
+ * Keeps current mode for DeepSeek and reports no-op.
+ * @returns {Promise<{applied:boolean,detail:string,preview:string}>}
+ */
+async function switchDeepseekMode() {
+  return {
+    applied: true,
+    detail: 'deepseek mode unchanged',
+    preview: ''
+  };
+}
+
+/**
+ * Tries to switch Kimi from thinking mode to fast mode.
+ * @returns {Promise<{applied:boolean,detail:string,preview:string}>}
+ */
+async function switchKimiMode() {
+  const controls = collectModeControls();
+  const thinkingToggle = controls.find((element) => {
+    const text = readModeControlText(element).toLowerCase();
+    return /深度思考|思考|thinking/.test(text) && isActiveModeControl(element);
+  });
+  if (thinkingToggle && clickModeControl(thinkingToggle)) {
+    await waitMs(300);
+    return {
+      applied: true,
+      detail: 'disabled active thinking toggle',
+      preview: readModeControlText(thinkingToggle)
+    };
+  }
+
+  const fastControl = controls.find((element) => /快速|fast|标准/.test(readModeControlText(element).toLowerCase()));
+  if (fastControl && clickModeControl(fastControl)) {
+    await waitMs(300);
+    return {
+      applied: true,
+      detail: 'selected fast mode control',
+      preview: readModeControlText(fastControl)
+    };
+  }
+
+  return {
+    applied: false,
+    detail: 'no kimi fast/thinking controls matched',
+    preview: controls
+      .map((element) => readModeControlText(element))
+      .filter(Boolean)
+      .slice(0, 12)
+      .join(' | ')
+  };
+}
+
+/**
+ * Tries to switch Gemini to fast/flash mode.
+ * @returns {Promise<{applied:boolean,detail:string,preview:string}>}
+ */
+async function switchGeminiMode() {
+  const clickByRegex = (regex) => {
+    const controls = collectModeControls();
+    const matched = controls.find((element) => regex.test(readModeControlText(element)));
+    if (!matched || !clickModeControl(matched)) {
+      return '';
+    }
+
+    return readModeControlText(matched);
+  };
+
+  const directFast = clickByRegex(/flash|快速|fast/i);
+  if (directFast) {
+    await waitMs(500);
+    return {
+      applied: true,
+      detail: 'selected fast/flash mode directly',
+      preview: directFast
+    };
+  }
+
+  const modelPicker = clickByRegex(/gemini|模型|model|pro|thinking|思考/i);
+  if (modelPicker) {
+    await waitMs(800);
+    const flashAfterOpen = clickByRegex(/flash|快速|fast/i);
+    if (flashAfterOpen) {
+      await waitMs(500);
+      return {
+        applied: true,
+        detail: 'opened model picker then selected fast/flash',
+        preview: flashAfterOpen
+      };
+    }
+
+    return {
+      applied: false,
+      detail: 'model picker clicked but no fast/flash option found',
+      preview: modelPicker
+    };
+  }
+
+  const controls = collectModeControls();
+  return {
+    applied: false,
+    detail: 'no gemini fast/thinking controls matched',
+    preview: controls
+      .map((element) => readModeControlText(element))
+      .filter(Boolean)
+      .slice(0, 12)
+      .join(' | ')
+  };
+}
+
+/**
+ * Appends one text fragment while removing empty/duplicate fragments.
+ * @param {string[]} output
+ * @param {unknown} text
+ */
+function appendUniqueTextFragment(output, text) {
+  const sanitized = String(text === null || text === undefined ? '' : text).replace(
+    /[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g,
+    ''
+  );
+  const normalized = normalizeCapturedText(sanitized);
+  if (!normalized) {
+    return;
+  }
+
+  const previous = output.length > 0 ? output[output.length - 1] : '';
+  if (previous === normalized) {
+    return;
+  }
+
+  output.push(normalized);
+}
+
+/**
+ * Removes consecutive duplicate lines from captured response text.
+ * @param {string} text
+ * @returns {string}
+ */
+function dedupeConsecutiveLines(text) {
+  const normalized = normalizeCapturedText(text);
+  if (!normalized) {
+    return '';
+  }
+
+  const lines = normalized
+    .split('\n')
+    .map((line) => normalizeCapturedText(line))
+    .filter(Boolean);
+  if (lines.length === 0) {
+    return '';
+  }
+
+  const uniqueLines = [];
+  let previous = '';
+  for (const line of lines) {
+    if (line === previous) {
+      continue;
+    }
+    uniqueLines.push(line);
+    previous = line;
+  }
+
+  return normalizeCapturedText(uniqueLines.join('\n'));
+}
+
+/**
+ * Parses JSON payloads from SSE-like lines (`data: {...}`).
+ * @param {string} rawText
+ * @returns {Array<unknown>}
+ */
+function extractJsonPayloadsFromSse(rawText) {
+  const payloads = [];
+  const lines = String(rawText || '').split('\n');
+  for (const rawLine of lines) {
+    let line = String(rawLine || '').trim();
+    if (!line) {
+      continue;
+    }
+
+    if (line.startsWith('data:')) {
+      line = line.slice(5).trim();
+    }
+    if (!line || line === '[DONE]' || line === '[done]') {
+      continue;
+    }
+
+    if (!line.startsWith('{') && !line.startsWith('[')) {
+      continue;
+    }
+
+    try {
+      payloads.push(JSON.parse(line));
+    } catch (_error) {
+      // Ignore malformed SSE payloads.
+    }
+  }
+
+  return payloads;
+}
+
+/**
+ * Extracts assistant/model text from common chat message payload shape.
+ * @param {unknown} message
+ * @param {string[]} output
+ */
+function collectAssistantTextFromMessage(message, output) {
+  if (!message || typeof message !== 'object') {
+    return;
+  }
+
+  const role = typeof message.role === 'string' ? message.role.trim().toLowerCase() : '';
+  if (role && role !== 'assistant' && role !== 'model') {
+    return;
+  }
+
+  if (typeof message.content === 'string') {
+    appendUniqueTextFragment(output, message.content);
+  }
+
+  const content = message.content && typeof message.content === 'object' ? message.content : null;
+  if (content) {
+    if (Array.isArray(content.parts)) {
+      for (const part of content.parts) {
+        if (typeof part === 'string') {
+          appendUniqueTextFragment(output, part);
+        } else if (part && typeof part === 'object') {
+          appendUniqueTextFragment(output, part.text);
+          appendUniqueTextFragment(output, part.content);
+        }
+      }
+    }
+
+    appendUniqueTextFragment(output, content.text);
+    appendUniqueTextFragment(output, content.output_text);
+  }
+
+  if (Array.isArray(message.blocks)) {
+    for (const block of message.blocks) {
+      if (!block || typeof block !== 'object') {
+        continue;
+      }
+
+      const text = block.text && typeof block.text === 'object' ? block.text.content : '';
+      appendUniqueTextFragment(output, text);
+    }
+  }
+
+  if (message.text && typeof message.text === 'object') {
+    appendUniqueTextFragment(output, message.text.content);
+  }
+}
+
+/**
+ * Merges JSON payloads from both SSE and framed transport formats.
+ * @param {string} rawText
+ * @returns {Array<unknown>}
+ */
+function collectStructuredPayloads(rawText) {
+  const payloads = [];
+  const ssePayloads = extractJsonPayloadsFromSse(rawText);
+  for (const payload of ssePayloads) {
+    payloads.push(payload);
+  }
+
+  const framedPayloads = extractJsonPayloadsFromRaw(rawText);
+  for (const payload of framedPayloads) {
+    payloads.push(payload);
+  }
+
+  return payloads;
+}
+
+/**
+ * Site-specific response extractor for ChatGPT capture payload.
+ * @param {string} rawText
+ * @returns {string}
+ */
+function extractChatgptResponseText(rawText) {
+  const payloads = collectStructuredPayloads(rawText);
+  const fragments = [];
+
+  for (const payload of payloads) {
+    if (!payload || typeof payload !== 'object') {
+      continue;
+    }
+
+    collectAssistantTextFromMessage(payload.message, fragments);
+    if (payload.v && typeof payload.v === 'object') {
+      collectAssistantTextFromMessage(payload.v.message, fragments);
+      appendUniqueTextFragment(fragments, payload.v.output_text);
+    }
+
+    if (Array.isArray(payload.choices)) {
+      for (const choice of payload.choices) {
+        if (!choice || typeof choice !== 'object') {
+          continue;
+        }
+        appendUniqueTextFragment(fragments, choice.text);
+        appendUniqueTextFragment(fragments, choice.delta && choice.delta.content);
+        if (choice.message && typeof choice.message === 'object') {
+          collectAssistantTextFromMessage(choice.message, fragments);
+        }
+      }
+    }
+  }
+
+  return removeIntermediateStatusLines(fragments.join('\n'));
+}
+
+/**
+ * Site-specific response extractor for Kimi capture payload.
+ * @param {string} rawText
+ * @returns {string}
+ */
+function extractKimiResponseText(rawText) {
+  const payloads = collectStructuredPayloads(rawText);
+  const fragments = [];
+
+  /**
+   * Picks latest chat message content from Kimi ListChats payload.
+   * @param {Array<unknown>} chats
+   * @returns {string}
+   */
+  const pickLatestChatMessageContent = (chats) => {
+    if (!Array.isArray(chats) || chats.length === 0) {
+      return '';
+    }
+
+    let bestContent = '';
+    let bestScore = Number.NEGATIVE_INFINITY;
+    for (let index = 0; index < chats.length; index += 1) {
+      const chat = chats[index];
+      if (!chat || typeof chat !== 'object') {
+        continue;
+      }
+
+      const content = normalizeCapturedText(chat.messageContent || '');
+      if (!content) {
+        continue;
+      }
+
+      const updateTimeMs = Date.parse(String(chat.updateTime || chat.createTime || ''));
+      const score = Number.isFinite(updateTimeMs) ? updateTimeMs : chats.length - index;
+      if (score > bestScore) {
+        bestScore = score;
+        bestContent = content;
+      }
+    }
+
+    return bestContent;
+  };
+
+  for (const payload of payloads) {
+    if (!payload || typeof payload !== 'object') {
+      continue;
+    }
+
+    const role =
+      typeof payload.role === 'string'
+        ? payload.role.trim().toLowerCase()
+        : typeof payload.message?.role === 'string'
+          ? payload.message.role.trim().toLowerCase()
+          : '';
+    if (role && role !== 'assistant' && role !== 'model') {
+      continue;
+    }
+
+    const blockText =
+      payload.block && payload.block.text && typeof payload.block.text === 'object' ? payload.block.text.content : '';
+    appendUniqueTextFragment(fragments, blockText);
+    collectAssistantTextFromMessage(payload.message, fragments);
+
+    if (Array.isArray(payload.chats)) {
+      appendUniqueTextFragment(fragments, pickLatestChatMessageContent(payload.chats));
+    }
+  }
+
+  return removeIntermediateStatusLines(fragments.join('\n'));
+}
+
+/**
+ * Site-specific response extractor for DeepSeek capture payload.
+ * @param {string} rawText
+ * @returns {string}
+ */
+function extractDeepseekResponseText(rawText) {
+  const payloads = collectStructuredPayloads(rawText);
+  const fragments = [];
+
+  for (const payload of payloads) {
+    if (!payload || typeof payload !== 'object') {
+      continue;
+    }
+
+    if (Array.isArray(payload.choices)) {
+      for (const choice of payload.choices) {
+        if (!choice || typeof choice !== 'object') {
+          continue;
+        }
+
+        appendUniqueTextFragment(fragments, choice.delta && choice.delta.content);
+        appendUniqueTextFragment(fragments, choice.text);
+        collectAssistantTextFromMessage(choice.message, fragments);
+      }
+    }
+
+    collectAssistantTextFromMessage(payload.message, fragments);
+  }
+
+  return removeIntermediateStatusLines(fragments.join('\n'));
+}
+
+/**
+ * Site-specific response extractor for Gemini capture payload.
+ * @param {string} rawText
+ * @returns {string}
+ */
+function extractGeminiResponseText(rawText) {
+  const payloads = collectStructuredPayloads(rawText);
+  const fragments = [];
+
+  for (const payload of payloads) {
+    if (!payload || typeof payload !== 'object') {
+      continue;
+    }
+
+    if (Array.isArray(payload.candidates)) {
+      for (const candidate of payload.candidates) {
+        if (!candidate || typeof candidate !== 'object') {
+          continue;
+        }
+
+        if (candidate.content && typeof candidate.content === 'object' && Array.isArray(candidate.content.parts)) {
+          for (const part of candidate.content.parts) {
+            if (!part || typeof part !== 'object') {
+              continue;
+            }
+            appendUniqueTextFragment(fragments, part.text);
+            appendUniqueTextFragment(fragments, part.content);
+          }
+        }
+
+        appendUniqueTextFragment(fragments, candidate.output_text);
+        appendUniqueTextFragment(fragments, candidate.text);
+      }
+    }
+
+    collectAssistantTextFromMessage(payload.message, fragments);
+    appendUniqueTextFragment(fragments, payload.output_text);
+  }
+
+  return removeIntermediateStatusLines(fragments.join('\n'));
+}
+
+/**
+ * Runs site-specific mode switching before prompt send.
+ * @param {{id:string,name:string,modeSwitcher?:Function}} adapter
+ * @returns {Promise<{applied:boolean,detail:string,preview:string}>}
+ */
+async function runAdapterModeSwitcher(adapter) {
+  if (!adapter || typeof adapter.modeSwitcher !== 'function') {
+    return {
+      applied: true,
+      detail: 'no mode switcher configured',
+      preview: ''
+    };
+  }
+
+  try {
+    const result = await adapter.modeSwitcher();
+    return normalizeModeSwitchResult(result, 'mode switcher returned invalid result');
+  } catch (error) {
+    return {
+      applied: false,
+      detail: `mode switcher failed: ${String(error)}`,
+      preview: ''
+    };
+  }
+}
+
+/**
  * Detects current target site adapter from location hostname.
- * @returns {{id:string,name:string,hostnames:string[],composerSelectors:string[],sendButtonSelectors:string[]} | null}
+ * @returns {{id:string,name:string,responseExtractor?:Function,modeSwitcher?:Function,hostnames:string[],composerSelectors:string[],sendButtonSelectors:string[]} | null}
  */
 function detectCurrentSiteAdapter() {
   const hostname = window.location.hostname.toLowerCase();
@@ -188,7 +848,7 @@ function detectCurrentSiteAdapter() {
 /**
  * Gets site adapter by id.
  * @param {string|undefined} siteId
- * @returns {{id:string,name:string,hostnames:string[],composerSelectors:string[],sendButtonSelectors:string[]} | null}
+ * @returns {{id:string,name:string,responseExtractor?:Function,modeSwitcher?:Function,hostnames:string[],composerSelectors:string[],sendButtonSelectors:string[]} | null}
  */
 function getSiteAdapterById(siteId) {
   if (!siteId || typeof siteId !== 'string') {
@@ -279,6 +939,36 @@ function readSourceTitleFromUrl() {
     console.error('Failed to parse source title from URL:', error);
     return '';
   }
+}
+
+/**
+ * Reads dump switch from URL query/localStorage.
+ * URL value has priority to support deterministic test harness enabling.
+ * @returns {boolean}
+ */
+function isCaptureDumpEnabled() {
+  try {
+    const searchParams = new URLSearchParams(window.location.search);
+    const queryValue = (searchParams.get(CAPTURE_DUMP_PARAM) || '').trim().toLowerCase();
+    if (queryValue) {
+      return ['1', 'true', 'yes', 'on'].includes(queryValue);
+    }
+  } catch (error) {
+    console.error('Failed to parse capture dump flag from URL:', error);
+  }
+
+  try {
+    const localValue = String(window.localStorage.getItem(CAPTURE_DUMP_PARAM) || '')
+      .trim()
+      .toLowerCase();
+    if (localValue) {
+      return ['1', 'true', 'yes', 'on'].includes(localValue);
+    }
+  } catch (error) {
+    console.error('Failed to parse capture dump flag from localStorage:', error);
+  }
+
+  return false;
 }
 
 /**
@@ -470,6 +1160,57 @@ function normalizeCapturedText(text) {
     .trim();
 }
 
+const INTERMEDIATE_STATUS_PATTERNS = [
+  /^思考中(?:\.\.\.|…)?$/i,
+  /^正在思考(?:\.\.\.|…)?$/i,
+  /^深度思考中(?:\.\.\.|…)?$/i,
+  /^搜索网页中(?:\.\.\.|…)?$/i,
+  /^正在搜索(?:网页|网络)?(?:\.\.\.|…)?$/i,
+  /^联网搜索中(?:\.\.\.|…)?$/i,
+  /^thinking(?:\.\.\.)?$/i,
+  /^searching(?: the)? web(?:\.\.\.)?$/i,
+  /^analyzing(?:\.\.\.)?$/i,
+  /^processing(?:\.\.\.)?$/i
+];
+
+/**
+ * Checks whether one line is likely a transient model status marker.
+ * @param {string} line
+ * @returns {boolean}
+ */
+function isIntermediateStatusLine(line) {
+  const normalizedLine = normalizeCapturedText(line);
+  if (!normalizedLine) {
+    return true;
+  }
+
+  if (normalizedLine.length > 80) {
+    return false;
+  }
+
+  return INTERMEDIATE_STATUS_PATTERNS.some((pattern) => pattern.test(normalizedLine));
+}
+
+/**
+ * Removes transient status-only lines (thinking/searching) from captured text.
+ * @param {string} text
+ * @returns {string}
+ */
+function removeIntermediateStatusLines(text) {
+  const normalized = normalizeCapturedText(text);
+  if (!normalized) {
+    return '';
+  }
+
+  const lines = normalized.split('\n').map((line) => normalizeCapturedText(line));
+  const filteredLines = lines.filter((line) => line && !isIntermediateStatusLine(line));
+  if (filteredLines.length === 0) {
+    return '';
+  }
+
+  return normalizeCapturedText(filteredLines.join('\n'));
+}
+
 /**
  * Builds a short one-line preview for debug logs.
  * @param {string} text
@@ -554,6 +1295,87 @@ function collectJsonTextFragments(value, path, output, depth = 0) {
 }
 
 /**
+ * Extracts valid JSON payload blocks from mixed raw stream text.
+ * This is used for framed protocols such as connect+json where each frame may
+ * carry binary prefix bytes before JSON payload.
+ * @param {string} raw
+ * @returns {Array<unknown>}
+ */
+function extractJsonPayloadsFromRaw(raw) {
+  const payloads = [];
+  const text = String(raw || '');
+  if (!text) {
+    return payloads;
+  }
+
+  let startIndex = -1;
+  let stack = [];
+  let inString = false;
+  let escaped = false;
+
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+
+    if (startIndex === -1) {
+      if (char === '{') {
+        startIndex = index;
+        stack = ['}'];
+        inString = false;
+        escaped = false;
+      } else if (char === '[') {
+        startIndex = index;
+        stack = [']'];
+        inString = false;
+        escaped = false;
+      }
+      continue;
+    }
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+    if (char === '{') {
+      stack.push('}');
+      continue;
+    }
+    if (char === '[') {
+      stack.push(']');
+      continue;
+    }
+    if (stack.length > 0 && char === stack[stack.length - 1]) {
+      stack.pop();
+      if (stack.length === 0) {
+        const candidate = text.slice(startIndex, index + 1);
+        startIndex = -1;
+        if (!candidate || candidate.length > 2 * 1024 * 1024) {
+          continue;
+        }
+
+        try {
+          payloads.push(JSON.parse(candidate));
+        } catch (_error) {
+          // Ignore non-JSON candidate fragments.
+        }
+      }
+    }
+  }
+
+  return payloads;
+}
+
+/**
  * Extracts readable response text from raw network capture stream.
  * @param {string} rawText
  * @returns {string}
@@ -596,7 +1418,7 @@ function extractReadableTextFromCapture(rawText) {
     fragments.push(line);
   }
 
-  const structuredText = normalizeCapturedText(fragments.join('\n'));
+  const structuredText = removeIntermediateStatusLines(fragments.join('\n'));
   if (structuredText.length >= MIN_RESPONSE_TEXT_LENGTH) {
     return structuredText;
   }
@@ -617,12 +1439,71 @@ function extractReadableTextFromCapture(rawText) {
     match = jsonTextFieldPattern.exec(raw);
   }
 
-  const regexExtractedText = normalizeCapturedText(regexExtractedFragments.join('\n'));
+  const regexExtractedText = removeIntermediateStatusLines(regexExtractedFragments.join('\n'));
   if (regexExtractedText.length >= MIN_RESPONSE_TEXT_LENGTH) {
     return regexExtractedText;
   }
 
-  return normalizeCapturedText(raw);
+  const mixedPayloads = extractJsonPayloadsFromRaw(raw);
+  if (mixedPayloads.length > 0) {
+    const mixedFragments = [];
+    for (const payload of mixedPayloads) {
+      collectJsonTextFragments(payload, '', mixedFragments);
+    }
+    const mixedExtractedText = removeIntermediateStatusLines(mixedFragments.join('\n'));
+    if (mixedExtractedText.length >= MIN_RESPONSE_TEXT_LENGTH) {
+      return mixedExtractedText;
+    }
+  }
+
+  return removeIntermediateStatusLines(raw);
+}
+
+/**
+ * Extracts response text with per-site extractor first and generic fallback.
+ * @param {string} targetSite
+ * @param {string} rawText
+ * @returns {{responseText:string,siteExtractedLength:number,genericExtractedLength:number,usedSiteExtractor:boolean}}
+ */
+function extractResponseTextBySite(targetSite, rawText) {
+  const adapter = getSiteAdapterById(targetSite);
+  let siteExtractedText = '';
+  if (adapter && typeof adapter.responseExtractor === 'function') {
+    try {
+      siteExtractedText = dedupeConsecutiveLines(adapter.responseExtractor(rawText));
+    } catch (error) {
+      console.error('Site response extractor failed, fallback to generic extractor:', {
+        targetSite,
+        error: String(error)
+      });
+    }
+  }
+
+  const genericExtractedText = dedupeConsecutiveLines(extractReadableTextFromCapture(rawText));
+  if (siteExtractedText.length >= MIN_RESPONSE_TEXT_LENGTH) {
+    return {
+      responseText: siteExtractedText,
+      siteExtractedLength: siteExtractedText.length,
+      genericExtractedLength: genericExtractedText.length,
+      usedSiteExtractor: true
+    };
+  }
+
+  if (siteExtractedText.length > 0) {
+    return {
+      responseText: siteExtractedText,
+      siteExtractedLength: siteExtractedText.length,
+      genericExtractedLength: genericExtractedText.length,
+      usedSiteExtractor: true
+    };
+  }
+
+  return {
+    responseText: genericExtractedText,
+    siteExtractedLength: siteExtractedText.length,
+    genericExtractedLength: genericExtractedText.length,
+    usedSiteExtractor: false
+  };
 }
 
 /**
@@ -642,8 +1523,95 @@ function postCaptureControlEvent(type, payload) {
 }
 
 /**
+ * Appends one capture dump event to session for offline rule analysis.
+ * @param {{
+ *   captureDumpEnabled:boolean,
+ *   captureDumpEvents:Array<Record<string, unknown>>,
+ *   captureDumpDropped:number
+ * }} session
+ * @param {Record<string, unknown>} event
+ */
+function appendCaptureDumpEvent(session, event) {
+  if (!session.captureDumpEnabled) {
+    return;
+  }
+
+  if (session.captureDumpEvents.length >= CAPTURE_DUMP_MAX_EVENTS) {
+    session.captureDumpDropped += 1;
+    return;
+  }
+
+  session.captureDumpEvents.push(event);
+}
+
+/**
+ * Builds serialized capture dump blob for webhook raw payload.
+ * @param {{
+ *   taskId:string,
+ *   targetSite:string,
+ *   startedAt:number,
+ *   captureDumpEnabled:boolean,
+ *   captureDumpEvents:Array<Record<string, unknown>>,
+ *   captureDumpDropped:number
+ * }} session
+ * @param {{reason?: string, captureChannel?: string, captureSourceUrl?: string, chunkCount?: number, durationMs?: number}|undefined} finalPayload
+ * @returns {string}
+ */
+function buildCaptureDump(session, finalPayload) {
+  if (!session.captureDumpEnabled) {
+    return '';
+  }
+
+  try {
+    return JSON.stringify({
+      taskId: session.taskId,
+      targetSite: session.targetSite,
+      startedAt: new Date(session.startedAt).toISOString(),
+      finalizedAt: new Date().toISOString(),
+      finalReason: finalPayload?.reason || '',
+      finalCaptureChannel: finalPayload?.captureChannel || '',
+      finalCaptureSourceUrl: finalPayload?.captureSourceUrl || '',
+      finalChunkCount:
+        Number.isFinite(finalPayload?.chunkCount) && finalPayload?.chunkCount >= 0
+          ? Number(finalPayload.chunkCount)
+          : null,
+      finalDurationMs:
+        Number.isFinite(finalPayload?.durationMs) && finalPayload?.durationMs >= 0
+          ? Number(finalPayload.durationMs)
+          : null,
+      droppedEventCount: session.captureDumpDropped,
+      eventCount: session.captureDumpEvents.length,
+      events: session.captureDumpEvents
+    });
+  } catch (error) {
+    console.error('Failed to serialize capture dump payload:', error);
+    return '';
+  }
+}
+
+/**
+ * Builds fallback capture metadata from in-memory session state.
+ * @param {{
+ *   captureChannel:string,
+ *   captureSourceUrl:string,
+ *   chunkCount:number,
+ *   startedAt:number
+ * }} session
+ * @returns {{captureMethod:string,captureChannel:string,captureSourceUrl:string,captureChunkCount:number,captureDurationMs:number}}
+ */
+function buildFallbackCaptureMeta(session) {
+  return {
+    captureMethod: 'network-intercept',
+    captureChannel: session.captureChannel || 'unknown',
+    captureSourceUrl: session.captureSourceUrl || '',
+    captureChunkCount: session.chunkCount,
+    captureDurationMs: Date.now() - session.startedAt
+  };
+}
+
+/**
  * Clears all timers for one network capture session.
- * @param {{ackTimer:number|null,hardTimer:number|null}} session
+ * @param {{ackTimer:number|null,hardTimer:number|null,dumpFlushTimer:number|null}} session
  */
 function clearNetworkCaptureSessionTimers(session) {
   if (session.ackTimer !== null) {
@@ -654,6 +1622,11 @@ function clearNetworkCaptureSessionTimers(session) {
   if (session.hardTimer !== null) {
     clearTimeout(session.hardTimer);
     session.hardTimer = null;
+  }
+
+  if (session.dumpFlushTimer !== null) {
+    clearTimeout(session.dumpFlushTimer);
+    session.dumpFlushTimer = null;
   }
 }
 
@@ -676,6 +1649,14 @@ function cleanupNetworkCaptureSession(taskId, reason) {
   } catch (error) {
     console.error('Failed to post capture stop event:', error);
   }
+
+  sendRuntimeMessage({
+    action: CAPTURE_NETWORK_TRACK_STOP_ACTION,
+    taskId,
+    reason: typeof reason === 'string' ? reason : ''
+  }).catch((error) => {
+    console.error('Failed to stop background network tracking session:', error);
+  });
 }
 
 /**
@@ -690,13 +1671,30 @@ function failNetworkCaptureSession(taskId, error, extra) {
     return;
   }
 
+  appendCaptureDumpEvent(session, {
+    eventType: 'content_fail',
+    timestamp: Date.now(),
+    error: String(error),
+    extra: extra || {}
+  });
+
   session.completed = true;
   const normalizedError = error instanceof Error ? error : new Error(String(error));
+  const captureDump = buildCaptureDump(session, undefined);
+  const fallbackResponseText = normalizeCapturedText(session.chunks.join('\n'));
+  const fallbackCaptureMeta = buildFallbackCaptureMeta(session);
+  normalizedError.captureDump = captureDump;
+  normalizedError.fallbackResponseText = fallbackResponseText || '[capture-failed-debug]';
+  normalizedError.fallbackCaptureMeta = fallbackCaptureMeta;
   console.error('Network capture session failed.', {
     taskId,
     targetSite: session.targetSite,
     acked: session.acked,
     chunkCount: session.chunkCount,
+    captureDumpEnabled: session.captureDumpEnabled,
+    captureDumpLength: captureDump.length,
+    captureDumpEventCount: session.captureDumpEvents.length,
+    captureDumpDropped: session.captureDumpDropped,
     error: normalizedError.message,
     ...(extra || {})
   });
@@ -710,22 +1708,51 @@ function failNetworkCaptureSession(taskId, error, extra) {
  * @param {string} taskId
  * @param {{reason?: string, captureChannel?: string, captureSourceUrl?: string, chunkCount?: number, durationMs?: number}|undefined} finalPayload
  */
-function finalizeNetworkCaptureSession(taskId, finalPayload) {
+async function finalizeNetworkCaptureSession(taskId, finalPayload) {
   const session = networkCaptureSessions.get(taskId);
-  if (!session || session.completed) {
+  if (!session || session.completed || session.finalizing) {
+    return;
+  }
+  session.finalizing = true;
+
+  appendCaptureDumpEvent(session, {
+    eventType: 'content_final',
+    timestamp: Date.now(),
+    reason: finalPayload?.reason || '',
+    captureChannel: finalPayload?.captureChannel || '',
+    captureSourceUrl: finalPayload?.captureSourceUrl || '',
+    chunkCount: Number(finalPayload?.chunkCount),
+    durationMs: Number(finalPayload?.durationMs)
+  });
+
+  await waitForBackgroundNetworkIdle(taskId);
+  if (session.completed || !networkCaptureSessions.has(taskId)) {
     return;
   }
 
-  const responseText = extractReadableTextFromCapture(session.chunks.join(''));
+  const rawCombinedText = normalizeCapturedText(session.chunks.join('\n'));
+  const extracted = extractResponseTextBySite(session.targetSite, session.chunks.join(''));
+  let responseText = extracted.responseText;
   if (responseText.length < MIN_RESPONSE_TEXT_LENGTH) {
-    failNetworkCaptureSession(taskId, 'Captured response text is too short.', {
-      reason: finalPayload?.reason || null,
-      responseLength: responseText.length
-    });
-    return;
+    if (extracted.usedSiteExtractor && responseText.length > 0) {
+      logInfo('Accepted short response from site-specific extractor.', {
+        taskId,
+        targetSite: session.targetSite,
+        responseLength: responseText.length
+      });
+    } else if (session.captureDumpEnabled) {
+      responseText = rawCombinedText || '[capture-dump-only]';
+    } else {
+      failNetworkCaptureSession(taskId, 'Captured response text is too short.', {
+        reason: finalPayload?.reason || null,
+        responseLength: responseText.length
+      });
+      return;
+    }
   }
 
   session.completed = true;
+  const captureDump = buildCaptureDump(session, finalPayload);
   const captureMeta = {
     captureMethod: 'network-intercept',
     captureChannel: finalPayload?.captureChannel || session.captureChannel || 'unknown',
@@ -746,15 +1773,22 @@ function finalizeNetworkCaptureSession(taskId, finalPayload) {
     reason: finalPayload?.reason || null,
     chunkCount: captureMeta.captureChunkCount,
     responseLength: responseText.length,
+    siteExtractedLength: extracted.siteExtractedLength,
+    genericExtractedLength: extracted.genericExtractedLength,
     captureChannel: captureMeta.captureChannel,
     captureSourceUrl: captureMeta.captureSourceUrl || null,
-    durationMs: captureMeta.captureDurationMs
+    durationMs: captureMeta.captureDurationMs,
+    captureDumpEnabled: session.captureDumpEnabled,
+    captureDumpLength: captureDump.length,
+    captureDumpEventCount: session.captureDumpEvents.length,
+    captureDumpDropped: session.captureDumpDropped
   });
   logResponsePreview('stabilized', responseText);
 
   session.resolve({
     responseText,
-    captureMeta
+    captureMeta,
+    captureDump
   });
   cleanupNetworkCaptureSession(taskId, 'finalized');
 }
@@ -798,10 +1832,46 @@ function handleMainCaptureEvent(event) {
       session.ackTimer = null;
     }
 
+    appendCaptureDumpEvent(session, {
+      eventType: 'main_ack',
+      timestamp: Date.now(),
+      dumpAllObserved: payload.dumpAllObserved === true
+    });
     logInfo('Network capture session acknowledged.', {
       taskId,
-      targetSite: session.targetSite
+      targetSite: session.targetSite,
+      dumpAllObserved: payload.dumpAllObserved === true
     });
+    return;
+  }
+
+  if (type === CAPTURE_EVENT_TYPES.OBSERVED) {
+    const observedChunk = typeof payload.chunk === 'string' ? payload.chunk : '';
+    const observedPreview = buildTextPreview(observedChunk).slice(0, 100);
+    appendCaptureDumpEvent(session, {
+      eventType: 'main_observed',
+      timestamp: Number(payload.timestamp) || Date.now(),
+      observedType: typeof payload.observedType === 'string' ? payload.observedType : '',
+      captureChannel: typeof payload.captureChannel === 'string' ? payload.captureChannel : '',
+      captureSourceUrl: typeof payload.captureSourceUrl === 'string' ? payload.captureSourceUrl : '',
+      chunk: typeof payload.chunk === 'string' ? payload.chunk : '',
+      chunkLength: Number(payload.chunkLength) || 0,
+      isValidUrl: payload.isValidUrl === true,
+      isAllowedHost: payload.isAllowedHost === true,
+      hasKeyword: payload.hasKeyword === true,
+      passedFilter: payload.passedFilter === true
+    });
+    logInfo(
+      `Network observed data received taskId=${taskId} target=${session.targetSite} type=${
+        typeof payload.observedType === 'string' ? payload.observedType : ''
+      } channel=${typeof payload.captureChannel === 'string' ? payload.captureChannel : ''} passedFilter=${
+        payload.passedFilter === true
+      } isAllowedHost=${payload.isAllowedHost === true} hasKeyword=${payload.hasKeyword === true} chunkLength=${
+        Number(payload.chunkLength) || observedChunk.length || 0
+      } sourceUrl=${typeof payload.captureSourceUrl === 'string' ? payload.captureSourceUrl : ''} preview=${JSON.stringify(
+        observedPreview
+      )}`
+    );
     return;
   }
 
@@ -819,6 +1889,13 @@ function handleMainCaptureEvent(event) {
     if (typeof payload.captureSourceUrl === 'string' && payload.captureSourceUrl) {
       session.captureSourceUrl = payload.captureSourceUrl;
     }
+    appendCaptureDumpEvent(session, {
+      eventType: 'main_chunk',
+      timestamp: Number(payload.timestamp) || Date.now(),
+      captureChannel: typeof payload.captureChannel === 'string' ? payload.captureChannel : '',
+      captureSourceUrl: typeof payload.captureSourceUrl === 'string' ? payload.captureSourceUrl : '',
+      chunk
+    });
 
     if (session.chunkCount === 1 || session.chunkCount % 20 === 0) {
       logInfo('Network capture chunk received.', {
@@ -834,6 +1911,12 @@ function handleMainCaptureEvent(event) {
   }
 
   if (type === CAPTURE_EVENT_TYPES.STREAM_END) {
+    appendCaptureDumpEvent(session, {
+      eventType: 'main_stream_end',
+      timestamp: Number(payload.timestamp) || Date.now(),
+      captureChannel: typeof payload.captureChannel === 'string' ? payload.captureChannel : '',
+      captureSourceUrl: typeof payload.captureSourceUrl === 'string' ? payload.captureSourceUrl : ''
+    });
     logInfo('Network capture stream-end signal received.', {
       taskId,
       targetSite: session.targetSite,
@@ -844,6 +1927,13 @@ function handleMainCaptureEvent(event) {
   }
 
   if (type === CAPTURE_EVENT_TYPES.ERROR) {
+    appendCaptureDumpEvent(session, {
+      eventType: 'main_error',
+      timestamp: Date.now(),
+      captureChannel: typeof payload.captureChannel === 'string' ? payload.captureChannel : '',
+      captureSourceUrl: typeof payload.captureSourceUrl === 'string' ? payload.captureSourceUrl : '',
+      error: typeof payload.error === 'string' ? payload.error : ''
+    });
     const errorMessage =
       typeof payload.error === 'string' && payload.error.trim() ? payload.error.trim() : 'Unknown capture error';
     failNetworkCaptureSession(taskId, errorMessage, {
@@ -860,6 +1950,10 @@ function handleMainCaptureEvent(event) {
       captureSourceUrl: typeof payload.captureSourceUrl === 'string' ? payload.captureSourceUrl : '',
       chunkCount: Number(payload.captureChunkCount),
       durationMs: Number(payload.captureDurationMs)
+    }).catch((error) => {
+      failNetworkCaptureSession(taskId, error instanceof Error ? error : String(error), {
+        phase: 'finalize_after_main_final'
+      });
     });
   }
 }
@@ -880,7 +1974,7 @@ function ensureCaptureBridgeInitialized() {
 /**
  * Starts one network capture session for the task and returns final result promise.
  * @param {{taskId: string, targetSite: string}} taskContext
- * @returns {Promise<{responseText: string, captureMeta: {captureMethod:string,captureChannel:string,captureSourceUrl:string,captureChunkCount:number,captureDurationMs:number}}>}
+ * @returns {Promise<{responseText: string, captureMeta: {captureMethod:string,captureChannel:string,captureSourceUrl:string,captureChunkCount:number,captureDurationMs:number}, captureDump: string}>}
  */
 function startNetworkCaptureSession(taskContext) {
   ensureCaptureBridgeInitialized();
@@ -895,6 +1989,7 @@ function startNetworkCaptureSession(taskContext) {
   }
 
   return new Promise((resolve, reject) => {
+    const captureDumpEnabled = isCaptureDumpEnabled();
     const session = {
       taskId,
       targetSite: taskContext.targetSite,
@@ -903,10 +1998,15 @@ function startNetworkCaptureSession(taskContext) {
       chunkCount: 0,
       captureChannel: '',
       captureSourceUrl: '',
+      captureDumpEnabled,
+      captureDumpEvents: [],
+      captureDumpDropped: 0,
       acked: false,
       completed: false,
+      finalizing: false,
       ackTimer: null,
       hardTimer: null,
+      dumpFlushTimer: null,
       resolve,
       reject
     };
@@ -923,18 +2023,52 @@ function startNetworkCaptureSession(taskContext) {
       });
     }, CAPTURE_HARD_TIMEOUT_MS);
 
+    if (captureDumpEnabled) {
+      session.dumpFlushTimer = setTimeout(() => {
+        failNetworkCaptureSession(taskId, 'Capture dump window elapsed.', {
+          timeoutMs: CAPTURE_DUMP_FLUSH_TIMEOUT_MS
+        });
+      }, CAPTURE_DUMP_FLUSH_TIMEOUT_MS);
+    }
+
     networkCaptureSessions.set(taskId, session);
+    appendCaptureDumpEvent(session, {
+      eventType: 'content_start',
+      timestamp: Date.now(),
+      targetSite: session.targetSite,
+      captureDumpEnabled
+    });
     logInfo('Network capture session started.', {
       taskId,
       targetSite: taskContext.targetSite,
+      captureDumpEnabled,
       ackTimeoutMs: CAPTURE_ACK_TIMEOUT_MS,
-      hardTimeoutMs: CAPTURE_HARD_TIMEOUT_MS
+      hardTimeoutMs: CAPTURE_HARD_TIMEOUT_MS,
+      dumpFlushTimeoutMs: captureDumpEnabled ? CAPTURE_DUMP_FLUSH_TIMEOUT_MS : 0
     });
+
+    sendRuntimeMessage({
+      action: CAPTURE_NETWORK_TRACK_START_ACTION,
+      taskId: session.taskId,
+      targetSite: session.targetSite,
+      startedAt: session.startedAt
+    })
+      .then((result) => {
+        logInfo('Background network tracking session started.', {
+          taskId: session.taskId,
+          targetSite: session.targetSite,
+          result: result || null
+        });
+      })
+      .catch((error) => {
+        console.error('Failed to start background network tracking session:', error);
+      });
 
     try {
       postCaptureControlEvent(CAPTURE_EVENT_TYPES.START, {
         taskId: session.taskId,
         targetSite: session.targetSite,
+        dumpAllObserved: captureDumpEnabled,
         startedAt: session.startedAt
       });
     } catch (error) {
@@ -950,8 +2084,9 @@ function startNetworkCaptureSession(taskContext) {
  * @param {{taskId: string, targetSite: string, sourceUrl: string, sourceTitle: string}} taskContext
  * @param {string} responseText
  * @param {{captureMethod:string,captureChannel:string,captureSourceUrl:string,captureChunkCount:number,captureDurationMs:number}} captureMeta
+ * @param {string} captureDump
  */
-async function reportAssistantResponse(taskContext, responseText, captureMeta) {
+async function reportAssistantResponse(taskContext, responseText, captureMeta, captureDump) {
   if (!taskContext.taskId || !responseText) {
     logInfo('Skip assistant response report due to invalid payload.', {
       taskId: taskContext.taskId || null,
@@ -972,7 +2107,8 @@ async function reportAssistantResponse(taskContext, responseText, captureMeta) {
     captureChannel: captureMeta.captureChannel,
     captureSourceUrl: captureMeta.captureSourceUrl,
     captureChunkCount: captureMeta.captureChunkCount,
-    captureDurationMs: captureMeta.captureDurationMs
+    captureDurationMs: captureMeta.captureDurationMs,
+    captureDump
   };
 
   logInfo('Reporting assistant response to background.', {
@@ -986,7 +2122,8 @@ async function reportAssistantResponse(taskContext, responseText, captureMeta) {
     captureChannel: captureMeta.captureChannel,
     captureSourceUrl: captureMeta.captureSourceUrl || null,
     captureChunkCount: captureMeta.captureChunkCount,
-    captureDurationMs: captureMeta.captureDurationMs
+    captureDurationMs: captureMeta.captureDurationMs,
+    captureDumpLength: typeof captureDump === 'string' ? captureDump.length : 0
   });
   logResponsePreview('reporting', responseText);
 
@@ -1042,6 +2179,15 @@ async function runWithText(finalText, preferredSiteId, incomingTaskContext) {
 
     markExecution(finalText, taskContext.taskId);
     const composer = await waitForComposer(adapter);
+    const modeSwitchResult = await runAdapterModeSwitcher(adapter);
+    logInfo('Site mode switcher completed.', {
+      site: adapter.id,
+      taskId: taskContext.taskId,
+      applied: modeSwitchResult.applied,
+      detail: modeSwitchResult.detail,
+      preview: modeSwitchResult.preview
+    });
+
     logInfo('Composer ready, writing prompt.', {
       site: adapter.id,
       taskId: taskContext.taskId,
@@ -1062,15 +2208,53 @@ async function runWithText(finalText, preferredSiteId, incomingTaskContext) {
       return;
     }
 
-    const captureResult = await capturePromise;
-    await reportAssistantResponse(taskContext, captureResult.responseText, captureResult.captureMeta);
-    logInfo('Assistant response captured and reported via network intercept.', {
-      site: adapter.id,
-      taskId: taskContext.taskId,
-      responseLength: captureResult.responseText.length,
-      captureChannel: captureResult.captureMeta.captureChannel,
-      captureChunkCount: captureResult.captureMeta.captureChunkCount
-    });
+    try {
+      const captureResult = await capturePromise;
+      await reportAssistantResponse(
+        taskContext,
+        captureResult.responseText,
+        captureResult.captureMeta,
+        captureResult.captureDump
+      );
+      logInfo('Assistant response captured and reported via network intercept.', {
+        site: adapter.id,
+        taskId: taskContext.taskId,
+        responseLength: captureResult.responseText.length,
+        captureChannel: captureResult.captureMeta.captureChannel,
+        captureChunkCount: captureResult.captureMeta.captureChunkCount,
+        captureDumpLength: typeof captureResult.captureDump === 'string' ? captureResult.captureDump.length : 0
+      });
+    } catch (captureError) {
+      const fallbackCaptureDump =
+        captureError && typeof captureError.captureDump === 'string' ? captureError.captureDump : '';
+      const fallbackResponseText =
+        captureError && typeof captureError.fallbackResponseText === 'string'
+          ? captureError.fallbackResponseText
+          : '[capture-failed-debug]';
+      const fallbackCaptureMeta =
+        captureError && captureError.fallbackCaptureMeta && typeof captureError.fallbackCaptureMeta === 'object'
+          ? captureError.fallbackCaptureMeta
+          : {
+              captureMethod: 'network-intercept',
+              captureChannel: 'unknown',
+              captureSourceUrl: '',
+              captureChunkCount: 0,
+              captureDurationMs: 0
+            };
+
+      if (fallbackCaptureDump) {
+        await reportAssistantResponse(taskContext, fallbackResponseText, fallbackCaptureMeta, fallbackCaptureDump);
+        logInfo('Capture failure fallback report sent with dump.', {
+          site: adapter.id,
+          taskId: taskContext.taskId,
+          fallbackResponseLength: fallbackResponseText.length,
+          captureDumpLength: fallbackCaptureDump.length
+        });
+        return;
+      }
+
+      throw captureError;
+    }
   } catch (error) {
     console.error('Failed to run auto-send flow:', error);
     if (taskContext && taskContext.taskId) {
