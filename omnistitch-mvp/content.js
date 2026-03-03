@@ -1753,9 +1753,8 @@ function startNetworkCaptureSession(taskContext) {
  * @param {{taskId: string, targetSite: string, sourceUrl: string, sourceTitle: string}} taskContext
  * @param {string} responseText
  * @param {{captureMethod:string,captureChannel:string,captureSourceUrl:string,captureChunkCount:number,captureDurationMs:number}} captureMeta
- * @param {string} captureDump
  */
-async function reportAssistantResponse(taskContext, responseText, captureMeta, captureDump) {
+async function reportAssistantResponse(taskContext, responseText, captureMeta) {
   if (!taskContext.taskId || !responseText) {
     logInfo('Skip assistant response report due to invalid payload.', {
       taskId: taskContext.taskId || null,
@@ -1776,8 +1775,7 @@ async function reportAssistantResponse(taskContext, responseText, captureMeta, c
     captureChannel: captureMeta.captureChannel,
     captureSourceUrl: captureMeta.captureSourceUrl,
     captureChunkCount: captureMeta.captureChunkCount,
-    captureDurationMs: captureMeta.captureDurationMs,
-    captureDump
+    captureDurationMs: captureMeta.captureDurationMs
   };
 
   logInfo('Reporting assistant response to background.', {
@@ -1791,8 +1789,7 @@ async function reportAssistantResponse(taskContext, responseText, captureMeta, c
     captureChannel: captureMeta.captureChannel,
     captureSourceUrl: captureMeta.captureSourceUrl || null,
     captureChunkCount: captureMeta.captureChunkCount,
-    captureDurationMs: captureMeta.captureDurationMs,
-    captureDumpLength: typeof captureDump === 'string' ? captureDump.length : 0
+    captureDurationMs: captureMeta.captureDurationMs
   });
   logResponsePreview('reporting', responseText);
 
@@ -1901,8 +1898,7 @@ async function runWithText(finalText, preferredSiteId, incomingTaskContext) {
       await reportAssistantResponse(
         taskContext,
         sanitizedResponseText,
-        captureResult.captureMeta,
-        captureResult.captureDump
+        captureResult.captureMeta
       );
       logInfo('Assistant response captured and reported via network intercept.', {
         site: adapter.id,
@@ -1933,7 +1929,7 @@ async function runWithText(finalText, preferredSiteId, incomingTaskContext) {
             };
 
       if (fallbackCaptureDump) {
-        await reportAssistantResponse(taskContext, fallbackResponseText, fallbackCaptureMeta, fallbackCaptureDump);
+        await reportAssistantResponse(taskContext, fallbackResponseText, fallbackCaptureMeta);
         logInfo('Capture failure fallback report sent with dump.', {
           site: adapter.id,
           taskId: taskContext.taskId,

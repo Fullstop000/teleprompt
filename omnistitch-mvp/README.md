@@ -72,3 +72,9 @@
   1. 打开目标站点控制台，搜索 `OMNISTITCH_CAPTURE_ACK`、`response_preview_100`。
   2. 若长期无 ACK，检查扩展是否已授权 `scripting` 权限并重载扩展。
   3. 若有 ACK 但无 FINAL，检查站点是否命中网络过滤规则（日志含 `captureSourceUrl`）。
+
+## E2E 脚本
+- 回复链路校验（发送/接收/内容验证）：
+  - `node scripts/headed-e2e-response-check.mjs --target-sites=deepseek`
+- 同步存储一致性校验（校验 webhook sync-store 字段完整性 + top/raw/display 一致）：
+  - `node scripts/headed-e2e-sync-store-check.mjs --target-sites=deepseek`

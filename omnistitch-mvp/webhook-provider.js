@@ -34,6 +34,9 @@ async function sync(payload, settings) {
     headers.Authorization = `Bearer ${settings.webhookAuthToken}`;
   }
 
+  // Capture dump is debug-only and must never be sent to external sync store.
+  const { captureDump: _captureDump, ...sanitizedRawPayload } = payload || {};
+
   const response = await fetch(parsedUrl.toString(), {
     method: 'POST',
     headers,
@@ -43,7 +46,7 @@ async function sync(payload, settings) {
       time: payload.capturedAt,
       aiResponse: payload.aiResponse,
       sourceUrl: payload.sourceUrl,
-      raw: payload
+      raw: sanitizedRawPayload
     })
   });
 
