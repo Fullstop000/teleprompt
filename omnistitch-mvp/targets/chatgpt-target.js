@@ -17,7 +17,8 @@ globalThis.switchChatgptMode = async function switchChatgptMode() {
  */
 globalThis.extractChatgptResponseText = function extractChatgptResponseText(rawText) {
   const payloads = collectStructuredPayloads(rawText);
-  const fragments = [];
+  const messageFragments = [];
+  const deltaFragments = [];
 
   /**
    * Appends delta operation text from ChatGPT stream payload.
@@ -44,7 +45,7 @@ globalThis.extractChatgptResponseText = function extractChatgptResponseText(rawT
         continue;
       }
 
-      appendUniqueTextFragment(fragments, value);
+      appendUniqueTextFragment(deltaFragments, value);
     }
   };
 
@@ -59,14 +60,14 @@ globalThis.extractChatgptResponseText = function extractChatgptResponseText(rawT
       continue;
     }
 
-    collectAssistantTextFromMessage(payload.message, fragments);
+    collectAssistantTextFromMessage(payload.message, messageFragments);
     appendDeltaOperationsText(payload);
     appendDeltaOperationsText(payload.v);
     appendDeltaOperationsText(payload.delta);
 
     if (payload.v && typeof payload.v === 'object') {
-      collectAssistantTextFromMessage(payload.v.message, fragments);
-      appendUniqueTextFragment(fragments, payload.v.output_text);
+      collectAssistantTextFromMessage(payload.v.message, messageFragments);
+      appendUniqueTextFragment(messageFragments, payload.v.output_text);
     }
 
     if (Array.isArray(payload.choices)) {
@@ -75,16 +76,23 @@ globalThis.extractChatgptResponseText = function extractChatgptResponseText(rawT
           continue;
         }
 
-        appendUniqueTextFragment(fragments, choice.text);
-        appendUniqueTextFragment(fragments, choice.delta && choice.delta.content);
+        appendUniqueTextFragment(messageFragments, choice.text);
+        appendUniqueTextFragment(deltaFragments, choice.delta && choice.delta.content);
         if (choice.message && typeof choice.message === 'object') {
-          collectAssistantTextFromMessage(choice.message, fragments);
+          collectAssistantTextFromMessage(choice.message, messageFragments);
         }
       }
     }
   }
 
-  return removeIntermediateStatusLines(fragments.join('\n'));
+  // Prefer full assistant message payloads to avoid duplicated sync content.
+  const preferred = removeIntermediateStatusLines(messageFragments.join('\n'));
+  if (preferred) {
+    return preferred;
+  }
+
+  // Fallback to delta-only fragments when message payloads are unavailable.
+  return removeIntermediateStatusLines(deltaFragments.join('\n'));
 };
 
 /**

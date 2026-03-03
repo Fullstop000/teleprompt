@@ -17,7 +17,8 @@ globalThis.switchDeepseekMode = async function switchDeepseekMode() {
  */
 globalThis.extractDeepseekResponseText = function extractDeepseekResponseText(rawText) {
   const payloads = collectStructuredPayloads(rawText);
-  const fragments = [];
+  const messageFragments = [];
+  const deltaFragments = [];
 
   /**
    * Appends DeepSeek delta operations that mutate response fragment content.
@@ -41,14 +42,15 @@ globalThis.extractDeepseekResponseText = function extractDeepseekResponseText(ra
       return;
     }
 
-    appendUniqueTextFragment(fragments, value);
+    appendUniqueTextFragment(deltaFragments, value);
   };
 
   /**
    * Appends response fragment text from DeepSeek response object.
    * @param {unknown} response
+   * @param {string[]} output
    */
-  const appendDeepseekResponseFragments = (response) => {
+  const appendDeepseekResponseFragments = (response, output) => {
     if (!response || typeof response !== 'object' || !Array.isArray(response.fragments)) {
       return;
     }
@@ -58,8 +60,8 @@ globalThis.extractDeepseekResponseText = function extractDeepseekResponseText(ra
         continue;
       }
 
-      appendUniqueTextFragment(fragments, fragment.content);
-      appendUniqueTextFragment(fragments, fragment.text);
+      appendUniqueTextFragment(output, fragment.content);
+      appendUniqueTextFragment(output, fragment.text);
     }
   };
 
@@ -69,22 +71,22 @@ globalThis.extractDeepseekResponseText = function extractDeepseekResponseText(ra
     }
 
     appendDeepseekDeltaOperation(payload);
-    collectAssistantTextFromMessage(payload.message, fragments);
+    collectAssistantTextFromMessage(payload.message, messageFragments);
 
     if (typeof payload.v === 'string') {
-      appendUniqueTextFragment(fragments, payload.v);
+      appendUniqueTextFragment(deltaFragments, payload.v);
     }
 
     if (payload.v && typeof payload.v === 'object') {
-      appendUniqueTextFragment(fragments, payload.v.text);
-      appendUniqueTextFragment(fragments, payload.v.content);
-      collectAssistantTextFromMessage(payload.v.message, fragments);
+      appendUniqueTextFragment(messageFragments, payload.v.text);
+      appendUniqueTextFragment(messageFragments, payload.v.content);
+      collectAssistantTextFromMessage(payload.v.message, messageFragments);
 
       if (payload.v.response && typeof payload.v.response === 'object') {
-        appendUniqueTextFragment(fragments, payload.v.response.text);
-        appendUniqueTextFragment(fragments, payload.v.response.content);
-        collectAssistantTextFromMessage(payload.v.response, fragments);
-        appendDeepseekResponseFragments(payload.v.response);
+        appendUniqueTextFragment(messageFragments, payload.v.response.text);
+        appendUniqueTextFragment(messageFragments, payload.v.response.content);
+        collectAssistantTextFromMessage(payload.v.response, messageFragments);
+        appendDeepseekResponseFragments(payload.v.response, messageFragments);
       }
     }
 
@@ -94,21 +96,28 @@ globalThis.extractDeepseekResponseText = function extractDeepseekResponseText(ra
           continue;
         }
 
-        appendUniqueTextFragment(fragments, choice.delta && choice.delta.content);
-        appendUniqueTextFragment(fragments, choice.text);
-        collectAssistantTextFromMessage(choice.message, fragments);
+        appendUniqueTextFragment(deltaFragments, choice.delta && choice.delta.content);
+        appendUniqueTextFragment(messageFragments, choice.text);
+        collectAssistantTextFromMessage(choice.message, messageFragments);
       }
     }
 
     if (payload.response && typeof payload.response === 'object') {
-      appendUniqueTextFragment(fragments, payload.response.text);
-      appendUniqueTextFragment(fragments, payload.response.content);
-      collectAssistantTextFromMessage(payload.response, fragments);
-      appendDeepseekResponseFragments(payload.response);
+      appendUniqueTextFragment(messageFragments, payload.response.text);
+      appendUniqueTextFragment(messageFragments, payload.response.content);
+      collectAssistantTextFromMessage(payload.response, messageFragments);
+      appendDeepseekResponseFragments(payload.response, messageFragments);
     }
   }
 
-  return removeIntermediateStatusLines(fragments.join('\n'));
+  // Prefer full assistant message payloads to avoid duplicated sync content.
+  const preferred = removeIntermediateStatusLines(messageFragments.join('\n'));
+  if (preferred) {
+    return preferred;
+  }
+
+  // Fallback to delta-only fragments when message payloads are unavailable.
+  return removeIntermediateStatusLines(deltaFragments.join('\n'));
 };
 
 /**

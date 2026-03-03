@@ -45,7 +45,8 @@ globalThis.switchKimiMode = async function switchKimiMode() {
  */
 globalThis.extractKimiResponseText = function extractKimiResponseText(rawText) {
   const payloads = collectStructuredPayloads(rawText);
-  const fragments = [];
+  const streamFragments = [];
+  const snapshotFragments = [];
 
   /**
    * Picks latest chat message content from Kimi ListChats payload.
@@ -98,15 +99,22 @@ globalThis.extractKimiResponseText = function extractKimiResponseText(rawText) {
 
     const blockText =
       payload.block && payload.block.text && typeof payload.block.text === 'object' ? payload.block.text.content : '';
-    appendUniqueTextFragment(fragments, blockText);
-    collectAssistantTextFromMessage(payload.message, fragments);
+    appendUniqueTextFragment(streamFragments, blockText);
+    collectAssistantTextFromMessage(payload.message, streamFragments);
 
     if (Array.isArray(payload.chats)) {
-      appendUniqueTextFragment(fragments, pickLatestChatMessageContent(payload.chats));
+      appendUniqueTextFragment(snapshotFragments, pickLatestChatMessageContent(payload.chats));
     }
   }
 
-  return removeIntermediateStatusLines(fragments.join('\n'));
+  // Prefer list-chat snapshots to avoid duplicating stream fragments in sync payload.
+  const preferred = removeIntermediateStatusLines(snapshotFragments.join('\n'));
+  if (preferred) {
+    return preferred;
+  }
+
+  // Fallback to stream fragments when snapshot payload is unavailable.
+  return removeIntermediateStatusLines(streamFragments.join('\n'));
 };
 
 /**

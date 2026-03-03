@@ -30,11 +30,6 @@ const CAPTURE_NETWORK_WAIT_IDLE_ACTION = 'omnistitch_capture_network_wait_idle';
 const CAPTURE_NETWORK_IDLE_WINDOW_MS = 1600;
 const CAPTURE_NETWORK_WAIT_TIMEOUT_MS = 7000;
 const CAPTURE_NETWORK_WAIT_POLL_MS = 200;
-const DEBUGGER_PROTOCOL_VERSION = '1.3';
-const DEBUGGER_CAPTURE_TIMEOUT_MS = 180000;
-const DEBUGGER_CAPTURE_RETENTION_MS = 10 * 60 * 1000;
-const DEBUGGER_CAPTURE_WAIT_TIMEOUT_MS = 6000;
-const DEBUGGER_CAPTURE_WAIT_POLL_MS = 200;
 const KIMI_CHAT_SERVICE_PATH = '/apiv2/kimi.gateway.chat.v1.chatservice/chat';
 const URL_KEYWORDS = ['chat', 'conversation', 'assistant', 'completion', 'generate', 'response', 'stream'];
 const SYNC_RETRY_ALARM_NAME = 'omnistitch_sync_retry_alarm';
@@ -72,58 +67,6 @@ const TARGET_SITE_CONFIGS = {
     promptParam: null
   }
 };
-const CAPTURE_TEXT_FIELD_HINTS = [
-  'content',
-  'text',
-  'delta',
-  'answer',
-  'response',
-  'message',
-  'completion',
-  'output'
-];
-const CAPTURE_TEXT_IGNORE_HINTS = [
-  'role',
-  'id',
-  'model',
-  'type',
-  'index',
-  'finish_reason',
-  'token',
-  'created',
-  'status',
-  'scenario',
-  'time',
-  'timestamp'
-];
-
-/**
- * Active debugger capture sessions keyed by tab id.
- * @type {Map<number, {
- *   tabId:number,
- *   taskId:string,
- *   targetSite:string,
- *   startedAt:number,
- *   requestIds:Set<string>,
- *   requestUrl:string,
- *   completed:boolean,
- *   timeoutHandle:number|null
- * }>}
- */
-const debuggerCaptureSessionsByTabId = new Map();
-
-/**
- * Captured debugger fallback response text keyed by task id.
- * @type {Map<string, {
- *   taskId:string,
- *   responseText:string,
- *   captureSourceUrl:string,
- *   capturedAt:string,
- *   bodyLength:number
- * }>}
- */
-const debuggerCapturedByTaskId = new Map();
-
 /**
  * Active webRequest tracking sessions keyed by task id.
  * @type {Map<string, {
@@ -147,8 +90,6 @@ const webRequestTrackingSessionsByTaskId = new Map();
  */
 const webRequestTrackingTaskIdByTabId = new Map();
 
-let debuggerListenersInstalled = false;
-
 /**
  * Writes a background debug log with a stable prefix.
  * @param {...unknown} args
@@ -165,63 +106,6 @@ function logInfo(...args) {
 async function waitMs(ms) {
   await new Promise((resolve) => {
     setTimeout(resolve, ms);
-  });
-}
-
-/**
- * Promisified wrapper for chrome.debugger.attach.
- * @param {{tabId:number}} target
- * @returns {Promise<void>}
- */
-async function attachDebugger(target) {
-  await new Promise((resolve, reject) => {
-    chrome.debugger.attach(target, DEBUGGER_PROTOCOL_VERSION, () => {
-      const err = chrome.runtime.lastError;
-      if (err) {
-        reject(new Error(err.message));
-        return;
-      }
-      resolve(undefined);
-    });
-  });
-}
-
-/**
- * Promisified wrapper for chrome.debugger.detach.
- * @param {{tabId:number}} target
- * @returns {Promise<void>}
- */
-async function detachDebugger(target) {
-  await new Promise((resolve, reject) => {
-    chrome.debugger.detach(target, () => {
-      const err = chrome.runtime.lastError;
-      if (err) {
-        reject(new Error(err.message));
-        return;
-      }
-      resolve(undefined);
-    });
-  });
-}
-
-/**
- * Promisified wrapper for chrome.debugger.sendCommand.
- * @param {{tabId:number}} target
- * @param {string} method
- * @param {Record<string, unknown>} params
- * @returns {Promise<Record<string, unknown>>}
- */
-async function sendDebuggerCommand(target, method, params = {}) {
-  return new Promise((resolve, reject) => {
-    chrome.debugger.sendCommand(target, method, params, (result) => {
-      const err = chrome.runtime.lastError;
-      if (err) {
-        reject(new Error(err.message));
-        return;
-      }
-
-      resolve(result || {});
-    });
   });
 }
 
@@ -536,495 +420,6 @@ function handleWebRequestFinished(details) {
 }
 
 /**
- * Decodes base64 payload to UTF-8 text when debugger returns encoded body.
- * @param {string} base64Text
- * @returns {string}
- */
-function decodeBase64ToUtf8(base64Text) {
-  try {
-    const binary = atob(base64Text);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i += 1) {
-      bytes[i] = binary.charCodeAt(i);
-    }
-    return new TextDecoder().decode(bytes);
-  } catch (_error) {
-    return '';
-  }
-}
-
-/**
- * Determines whether one JSON path may contain assistant text.
- * @param {string} path
- * @returns {boolean}
- */
-function shouldCollectJsonTextField(path) {
-  const lowerPath = path.toLowerCase();
-  if (!CAPTURE_TEXT_FIELD_HINTS.some((hint) => lowerPath.includes(hint))) {
-    return false;
-  }
-
-  return !CAPTURE_TEXT_IGNORE_HINTS.some((hint) => lowerPath.endsWith(hint) || lowerPath.includes(`.${hint}.`));
-}
-
-/**
- * Recursively collects text fragments from parsed JSON payload.
- * @param {unknown} value
- * @param {string} path
- * @param {string[]} output
- * @param {number} depth
- */
-function collectJsonTextFragments(value, path, output, depth = 0) {
-  if (depth > 10 || value === null || value === undefined) {
-    return;
-  }
-
-  if (typeof value === 'string') {
-    if (path && shouldCollectJsonTextField(path) && value.trim()) {
-      output.push(value);
-    }
-    return;
-  }
-
-  if (Array.isArray(value)) {
-    for (let index = 0; index < value.length; index += 1) {
-      collectJsonTextFragments(value[index], path ? `${path}[${index}]` : `[${index}]`, output, depth + 1);
-    }
-    return;
-  }
-
-  if (typeof value === 'object') {
-    const role = typeof value.role === 'string' ? value.role.trim().toLowerCase() : '';
-    if (role && role !== 'assistant' && role !== 'model') {
-      return;
-    }
-
-    for (const [key, child] of Object.entries(value)) {
-      collectJsonTextFragments(child, path ? `${path}.${key}` : key, output, depth + 1);
-    }
-  }
-}
-
-/**
- * Extracts valid JSON payloads from mixed framed stream text.
- * @param {string} raw
- * @returns {Array<unknown>}
- */
-function extractJsonPayloadsFromRaw(raw) {
-  const payloads = [];
-  const text = String(raw || '');
-  if (!text) {
-    return payloads;
-  }
-
-  let startIndex = -1;
-  let stack = [];
-  let inString = false;
-  let escaped = false;
-
-  for (let index = 0; index < text.length; index += 1) {
-    const char = text[index];
-    if (startIndex === -1) {
-      if (char === '{') {
-        startIndex = index;
-        stack = ['}'];
-        inString = false;
-        escaped = false;
-      } else if (char === '[') {
-        startIndex = index;
-        stack = [']'];
-        inString = false;
-        escaped = false;
-      }
-      continue;
-    }
-
-    if (inString) {
-      if (escaped) {
-        escaped = false;
-      } else if (char === '\\') {
-        escaped = true;
-      } else if (char === '"') {
-        inString = false;
-      }
-      continue;
-    }
-
-    if (char === '"') {
-      inString = true;
-      continue;
-    }
-    if (char === '{') {
-      stack.push('}');
-      continue;
-    }
-    if (char === '[') {
-      stack.push(']');
-      continue;
-    }
-
-    if (stack.length > 0 && char === stack[stack.length - 1]) {
-      stack.pop();
-      if (stack.length === 0) {
-        const candidate = text.slice(startIndex, index + 1);
-        startIndex = -1;
-        if (!candidate || candidate.length > 2 * 1024 * 1024) {
-          continue;
-        }
-
-        try {
-          payloads.push(JSON.parse(candidate));
-        } catch (_error) {
-          // Ignore malformed non-JSON candidate fragments.
-        }
-      }
-    }
-  }
-
-  return payloads;
-}
-
-/**
- * Extracts assistant-like text from connect+json response body.
- * @param {string} rawBody
- * @returns {string}
- */
-function extractReadableTextFromConnectBody(rawBody) {
-  const payloads = extractJsonPayloadsFromRaw(rawBody);
-  if (payloads.length === 0) {
-    return '';
-  }
-
-  const fragments = [];
-  for (const payload of payloads) {
-    collectJsonTextFragments(payload, '', fragments);
-  }
-
-  return fragments.join('').replace(/\r/g, '').replace(/[ \t]{2,}/g, ' ').trim();
-}
-
-/**
- * Clears one debugger capture session and detaches debugger from target tab.
- * @param {number} tabId
- * @param {string} reason
- */
-async function stopDebuggerCaptureSession(tabId, reason) {
-  const session = debuggerCaptureSessionsByTabId.get(tabId);
-  if (!session) {
-    return;
-  }
-
-  if (session.timeoutHandle !== null) {
-    clearTimeout(session.timeoutHandle);
-  }
-  debuggerCaptureSessionsByTabId.delete(tabId);
-
-  try {
-    await detachDebugger({ tabId });
-  } catch (error) {
-    logInfo('Debugger detach skipped or failed.', {
-      tabId,
-      taskId: session.taskId,
-      reason,
-      error: String(error)
-    });
-    return;
-  }
-
-  logInfo('Debugger capture session closed.', {
-    tabId,
-    taskId: session.taskId,
-    reason
-  });
-}
-
-/**
- * Stores debugger-captured response text for task fallback replacement.
- * @param {string} taskId
- * @param {string} responseText
- * @param {string} captureSourceUrl
- * @param {number} bodyLength
- */
-function saveDebuggerCapturedResponse(taskId, responseText, captureSourceUrl, bodyLength) {
-  if (!taskId || !responseText) {
-    return;
-  }
-
-  const capture = {
-    taskId,
-    responseText,
-    captureSourceUrl: captureSourceUrl || '',
-    capturedAt: new Date().toISOString(),
-    bodyLength
-  };
-  debuggerCapturedByTaskId.set(taskId, capture);
-
-  setTimeout(() => {
-    const current = debuggerCapturedByTaskId.get(taskId);
-    if (current && current.capturedAt === capture.capturedAt) {
-      debuggerCapturedByTaskId.delete(taskId);
-    }
-  }, DEBUGGER_CAPTURE_RETENTION_MS);
-}
-
-/**
- * Gets and consumes debugger capture fallback for one task.
- * @param {string} taskId
- * @returns {{taskId:string,responseText:string,captureSourceUrl:string,capturedAt:string,bodyLength:number}|null}
- */
-function takeDebuggerCapturedResponse(taskId) {
-  if (!taskId) {
-    return null;
-  }
-
-  const capture = debuggerCapturedByTaskId.get(taskId) || null;
-  if (capture) {
-    debuggerCapturedByTaskId.delete(taskId);
-  }
-  return capture;
-}
-
-/**
- * Reads debugger capture fallback for one task without consuming it.
- * @param {string} taskId
- * @returns {{taskId:string,responseText:string,captureSourceUrl:string,capturedAt:string,bodyLength:number}|null}
- */
-function peekDebuggerCapturedResponse(taskId) {
-  if (!taskId) {
-    return null;
-  }
-
-  return debuggerCapturedByTaskId.get(taskId) || null;
-}
-
-/**
- * Waits a short window for debugger capture to arrive for one task.
- * @param {string} taskId
- * @param {number} timeoutMs
- * @returns {Promise<{taskId:string,responseText:string,captureSourceUrl:string,capturedAt:string,bodyLength:number}|null>}
- */
-async function waitForDebuggerCapturedResponse(taskId, timeoutMs = DEBUGGER_CAPTURE_WAIT_TIMEOUT_MS) {
-  if (!taskId || timeoutMs <= 0) {
-    return null;
-  }
-
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < timeoutMs) {
-    const capture = peekDebuggerCapturedResponse(taskId);
-    if (capture && capture.responseText) {
-      return capture;
-    }
-    await waitMs(DEBUGGER_CAPTURE_WAIT_POLL_MS);
-  }
-
-  return peekDebuggerCapturedResponse(taskId);
-}
-
-/**
- * Processes one matching debugger request completion and extracts response text.
- * @param {number} tabId
- * @param {string} requestId
- */
-async function handleDebuggerRequestCompleted(tabId, requestId) {
-  const session = debuggerCaptureSessionsByTabId.get(tabId);
-  if (!session || session.completed || !session.requestIds.has(requestId)) {
-    return;
-  }
-
-  session.completed = true;
-  let bodyText = '';
-  let captureSourceUrl = session.requestUrl || '';
-  try {
-    const result = await sendDebuggerCommand({ tabId }, 'Network.getResponseBody', { requestId });
-    const rawBody = typeof result.body === 'string' ? result.body : '';
-    bodyText = result.base64Encoded === true ? decodeBase64ToUtf8(rawBody) : rawBody;
-    const responseText = extractReadableTextFromConnectBody(bodyText);
-    if (responseText) {
-      saveDebuggerCapturedResponse(session.taskId, responseText, captureSourceUrl, bodyText.length);
-      logInfo('Debugger capture extracted Kimi response.', {
-        tabId,
-        taskId: session.taskId,
-        responseLength: responseText.length,
-        bodyLength: bodyText.length,
-        captureSourceUrl
-      });
-    } else {
-      logInfo('Debugger capture received body but no readable text extracted.', {
-        tabId,
-        taskId: session.taskId,
-        bodyLength: bodyText.length,
-        captureSourceUrl
-      });
-    }
-  } catch (error) {
-    console.error('Failed to parse debugger response body:', {
-      tabId,
-      taskId: session.taskId,
-      requestId,
-      error: String(error)
-    });
-  } finally {
-    await stopDebuggerCaptureSession(tabId, 'request_completed');
-  }
-}
-
-/**
- * Handles debugger network events and routes Kimi chat service traffic to fallback capture.
- * @param {chrome.debugger.Debuggee} source
- * @param {string} method
- * @param {Record<string, unknown>} params
- */
-function handleDebuggerEvent(source, method, params) {
-  const tabId = Number(source?.tabId);
-  if (!Number.isInteger(tabId)) {
-    return;
-  }
-
-  const session = debuggerCaptureSessionsByTabId.get(tabId);
-  if (!session) {
-    return;
-  }
-
-  if (method === 'Network.requestWillBeSent') {
-    const requestId = typeof params?.requestId === 'string' ? params.requestId : '';
-    const url = typeof params?.request?.url === 'string' ? params.request.url : '';
-    if (!requestId || !isKimiChatServiceUrl(url)) {
-      return;
-    }
-
-    session.requestIds.add(requestId);
-    session.requestUrl = url;
-    logInfo('Debugger matched Kimi chat request.', {
-      tabId,
-      taskId: session.taskId,
-      requestId,
-      url
-    });
-    return;
-  }
-
-  if (method === 'Network.loadingFinished') {
-    const requestId = typeof params?.requestId === 'string' ? params.requestId : '';
-    if (!requestId || !session.requestIds.has(requestId)) {
-      return;
-    }
-    handleDebuggerRequestCompleted(tabId, requestId).catch((error) => {
-      console.error('Failed handling debugger loadingFinished event:', error);
-    });
-  }
-}
-
-/**
- * Handles debugger detach events so stale sessions are cleaned up.
- * @param {chrome.debugger.Debuggee} source
- * @param {string} reason
- */
-function handleDebuggerDetach(source, reason) {
-  const tabId = Number(source?.tabId);
-  if (!Number.isInteger(tabId)) {
-    return;
-  }
-
-  const session = debuggerCaptureSessionsByTabId.get(tabId);
-  if (!session) {
-    return;
-  }
-
-  if (session.timeoutHandle !== null) {
-    clearTimeout(session.timeoutHandle);
-  }
-  debuggerCaptureSessionsByTabId.delete(tabId);
-  logInfo('Debugger capture session detached.', {
-    tabId,
-    taskId: session.taskId,
-    reason
-  });
-}
-
-/**
- * Ensures debugger event listeners are registered once.
- */
-function ensureDebuggerListenersInstalled() {
-  if (debuggerListenersInstalled) {
-    return;
-  }
-
-  debuggerListenersInstalled = true;
-  chrome.debugger.onEvent.addListener(handleDebuggerEvent);
-  chrome.debugger.onDetach.addListener(handleDebuggerDetach);
-}
-
-/**
- * Starts one Kimi-specific debugger capture session for fallback response extraction.
- * @param {number} tabId
- * @param {{taskId:string}} taskContext
- * @param {string} targetSite
- */
-async function startDebuggerCaptureForTask(tabId, taskContext, targetSite) {
-  if (!Number.isInteger(tabId) || targetSite !== 'kimi') {
-    return;
-  }
-  if (!taskContext || typeof taskContext.taskId !== 'string' || !taskContext.taskId) {
-    return;
-  }
-  if (!chrome.debugger || typeof chrome.debugger.attach !== 'function') {
-    return;
-  }
-
-  ensureDebuggerListenersInstalled();
-
-  if (debuggerCaptureSessionsByTabId.has(tabId)) {
-    await stopDebuggerCaptureSession(tabId, 'replaced');
-  }
-
-  try {
-    await attachDebugger({ tabId });
-  } catch (error) {
-    console.error('Failed to attach debugger for Kimi capture.', {
-      tabId,
-      taskId: taskContext.taskId,
-      error: String(error)
-    });
-    return;
-  }
-
-  try {
-    await sendDebuggerCommand({ tabId }, 'Network.enable');
-  } catch (error) {
-    console.error('Failed to enable debugger Network domain.', {
-      tabId,
-      taskId: taskContext.taskId,
-      error: String(error)
-    });
-    await stopDebuggerCaptureSession(tabId, 'network_enable_failed');
-    return;
-  }
-
-  const timeoutHandle = setTimeout(() => {
-    stopDebuggerCaptureSession(tabId, 'timeout').catch((error) => {
-      console.error('Failed to stop debugger session on timeout:', error);
-    });
-  }, DEBUGGER_CAPTURE_TIMEOUT_MS);
-
-  debuggerCaptureSessionsByTabId.set(tabId, {
-    tabId,
-    taskId: taskContext.taskId,
-    targetSite,
-    startedAt: Date.now(),
-    requestIds: new Set(),
-    requestUrl: '',
-    completed: false,
-    timeoutHandle
-  });
-
-  logInfo('Debugger capture session started.', {
-    tabId,
-    taskId: taskContext.taskId,
-    targetSite
-  });
-}
-
-/**
  * Logs currently registered extension commands for shortcut debugging.
  */
 function logRegisteredCommands() {
@@ -1257,7 +652,7 @@ async function loadSyncTargetSettings() {
 
 /**
  * Loads retry queue from current schema key.
- * @returns {Promise<Array<{id:string,payload:{taskId:string,targetSite:string,sourceUrl:string,sourceTitle:string,aiResponse:string,capturedAt:string,captureMethod:string,captureChannel:string,captureSourceUrl:string,captureChunkCount:number,captureDurationMs:number,captureDump:string},providerId:string,attempts:number,lastError:string,updatedAt:string}>>}
+ * @returns {Promise<Array<{id:string,payload:{taskId:string,targetSite:string,sourceUrl:string,sourceTitle:string,aiResponse:string,capturedAt:string,captureMethod:string,captureChannel:string,captureSourceUrl:string,captureChunkCount:number,captureDurationMs:number},providerId:string,attempts:number,lastError:string,updatedAt:string}>>}
  */
 async function loadSyncRetryQueue() {
   try {
@@ -1275,7 +670,7 @@ async function loadSyncRetryQueue() {
 
 /**
  * Saves sync retry queue into extension storage.
- * @param {Array<{id:string,payload:{taskId:string,targetSite:string,sourceUrl:string,sourceTitle:string,aiResponse:string,capturedAt:string,captureMethod:string,captureChannel:string,captureSourceUrl:string,captureChunkCount:number,captureDurationMs:number,captureDump:string},providerId:string,attempts:number,lastError:string,updatedAt:string}>} queue
+ * @param {Array<{id:string,payload:{taskId:string,targetSite:string,sourceUrl:string,sourceTitle:string,aiResponse:string,capturedAt:string,captureMethod:string,captureChannel:string,captureSourceUrl:string,captureChunkCount:number,captureDurationMs:number},providerId:string,attempts:number,lastError:string,updatedAt:string}>} queue
  */
 async function saveSyncRetryQueue(queue) {
   try {
@@ -1452,7 +847,7 @@ function buildProviderCredentialError(providerId) {
 /**
  * Normalizes one AI response report payload before syncing.
  * @param {{taskId?: string, targetSite?: string, sourceUrl?: string, sourceTitle?: string, aiResponse?: string, capturedAt?: string, captureMethod?: string, captureChannel?: string, captureSourceUrl?: string, captureChunkCount?: number|string, captureDurationMs?: number|string, captureDump?: string}} message
- * @returns {{taskId: string, targetSite: string, sourceUrl: string, sourceTitle: string, aiResponse: string, capturedAt: string, captureMethod: string, captureChannel: string, captureSourceUrl: string, captureChunkCount: number, captureDurationMs: number, captureDump: string}}
+ * @returns {{taskId: string, targetSite: string, sourceUrl: string, sourceTitle: string, aiResponse: string, capturedAt: string, captureMethod: string, captureChannel: string, captureSourceUrl: string, captureChunkCount: number, captureDurationMs: number}}
  */
 function normalizeAiResponsePayload(message) {
   const taskId = typeof message.taskId === 'string' ? message.taskId.trim() : '';
@@ -1489,8 +884,6 @@ function normalizeAiResponsePayload(message) {
     Number.isFinite(captureChunkCountValue) && captureChunkCountValue >= 0 ? captureChunkCountValue : 0;
   const captureDurationMs =
     Number.isFinite(captureDurationMsValue) && captureDurationMsValue >= 0 ? captureDurationMsValue : 0;
-  const captureDump = typeof message.captureDump === 'string' ? message.captureDump : '';
-
   return {
     taskId,
     targetSite,
@@ -1502,8 +895,7 @@ function normalizeAiResponsePayload(message) {
     captureChannel,
     captureSourceUrl,
     captureChunkCount,
-    captureDurationMs,
-    captureDump
+    captureDurationMs
   };
 }
 
@@ -1535,7 +927,7 @@ function getObsidianProvider() {
 
 /**
  * Dispatches sync payload to active provider implementation.
- * @param {{taskId: string, targetSite: string, sourceUrl: string, sourceTitle: string, aiResponse: string, capturedAt: string, captureMethod: string, captureChannel: string, captureSourceUrl: string, captureChunkCount: number, captureDurationMs: number, captureDump: string}} payload
+ * @param {{taskId: string, targetSite: string, sourceUrl: string, sourceTitle: string, aiResponse: string, capturedAt: string, captureMethod: string, captureChannel: string, captureSourceUrl: string, captureChunkCount: number, captureDurationMs: number}} payload
  * @param {{provider:string,webhookUrl:string,webhookAuthToken:string,obsidianBaseUrl:string,obsidianApiKey:string}} settings
  * @param {string} providerId
  */
@@ -1561,7 +953,7 @@ async function syncPayloadToProvider(payload, settings, providerId) {
 
 /**
  * Adds one failed payload into local retry queue.
- * @param {{taskId: string, targetSite: string, sourceUrl: string, sourceTitle: string, aiResponse: string, capturedAt: string, captureMethod: string, captureChannel: string, captureSourceUrl: string, captureChunkCount: number, captureDurationMs: number, captureDump: string}} payload
+ * @param {{taskId: string, targetSite: string, sourceUrl: string, sourceTitle: string, aiResponse: string, capturedAt: string, captureMethod: string, captureChannel: string, captureSourceUrl: string, captureChunkCount: number, captureDurationMs: number}} payload
  * @param {string} providerId
  * @param {string} lastError
  */
@@ -1691,8 +1083,7 @@ async function handleAiResponseReport(message) {
     captureChannel: payload.captureChannel,
     captureSourceUrl: payload.captureSourceUrl || null,
     captureChunkCount: payload.captureChunkCount,
-    captureDurationMs: payload.captureDurationMs,
-    captureDumpLength: payload.captureDump.length
+    captureDurationMs: payload.captureDurationMs
   });
 
   if (!syncSettings.autoSync || providerId === SYNC_PROVIDER_IDS.DISABLED) {
@@ -1731,8 +1122,7 @@ async function handleAiResponseReport(message) {
       targetSite: payload.targetSite,
       captureMethod: payload.captureMethod,
       captureChannel: payload.captureChannel,
-      captureChunkCount: payload.captureChunkCount,
-      captureDumpLength: payload.captureDump.length
+      captureChunkCount: payload.captureChunkCount
     });
     return { ok: true };
   } catch (error) {
