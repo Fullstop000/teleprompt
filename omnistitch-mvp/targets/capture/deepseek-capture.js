@@ -21,6 +21,8 @@
   function inspectDeepseekRequest(requestUrl, requestMethod) {
     const inspectGeneric = globalThis.inspectOmnistitchGenericCaptureRequest;
     const parseUrl = globalThis.parseOmnistitchCaptureUrl;
+    const normalizeMethod = globalThis.normalizeOmnistitchCaptureMethod;
+    const buildInspection = globalThis.buildOmnistitchCaptureInspection;
     if (typeof inspectGeneric !== 'function') {
       return {
         requestUrl: String(requestUrl || ''),
@@ -34,14 +36,32 @@
 
     const result = inspectGeneric(requestUrl, requestMethod, {
       allowedHosts: DEEPSEEK_ALLOWED_HOSTS,
-      forcePathSubstrings: [DEEPSEEK_COMPLETION_PATH],
       requiredMethod: 'POST'
     });
     const parsed = typeof parseUrl === 'function' ? parseUrl(requestUrl) : null;
+    const method = typeof normalizeMethod === 'function' ? normalizeMethod(requestMethod) : String(requestMethod || '');
     const pathAndSearch = parsed ? `${parsed.pathname}${parsed.search}`.toLowerCase() : '';
     const isCompletionRequest = pathAndSearch.includes(DEEPSEEK_COMPLETION_PATH);
+    const isPostMethod = method === 'POST';
+    const shouldTrack = Boolean(result.isValidUrl && result.isAllowedHost && isCompletionRequest && isPostMethod);
+
+    if (typeof buildInspection === 'function') {
+      return buildInspection({
+        requestUrl: result.requestUrl || String(requestUrl || ''),
+        isValidUrl: result.isValidUrl,
+        isAllowedHost: result.isAllowedHost,
+        hasKeyword: isCompletionRequest,
+        shouldTrack,
+        matchLabel: isCompletionRequest ? 'deepseek_completion' : ''
+      });
+    }
+
     return {
-      ...result,
+      requestUrl: result.requestUrl || String(requestUrl || ''),
+      isValidUrl: result.isValidUrl,
+      isAllowedHost: result.isAllowedHost,
+      hasKeyword: isCompletionRequest,
+      shouldTrack,
       matchLabel: isCompletionRequest ? 'deepseek_completion' : ''
     };
   }
