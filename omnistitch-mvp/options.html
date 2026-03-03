@@ -11,35 +11,89 @@
     <main class="ui-container ui-stack">
       <header class="hero">
         <h1 class="hero-title">OmniStitch 控制台</h1>
-        <p class="hero-subtitle">管理跳转目标与 Prompt 模板，让一键发送更稳定。</p>
+        <p class="hero-subtitle">管理跳转 Agent、Prompt 与同步配置，让一键发送更稳定。</p>
       </header>
 
       <section class="ui-card ui-section ui-stack">
-        <h2>跳转目标</h2>
-        <form id="target-form" class="ui-grid ui-grid-2 target-grid">
+        <h2>跳转 Agent</h2>
+        <form id="agent-form" class="ui-grid ui-grid-2 target-grid">
           <div>
-            <span class="ui-label">发送目标（可多选）</span>
+            <span class="ui-label">发送 Agent（可多选）</span>
             <div class="target-multi-select">
               <label class="target-option">
-                <input id="target-chatgpt" type="checkbox" name="target-sites" value="chatgpt" />
+                <input id="agent-chatgpt" type="checkbox" name="agent-sites" value="chatgpt" />
                 <span>ChatGPT</span>
               </label>
               <label class="target-option">
-                <input id="target-kimi" type="checkbox" name="target-sites" value="kimi" />
+                <input id="agent-kimi" type="checkbox" name="agent-sites" value="kimi" />
                 <span>Kimi</span>
               </label>
               <label class="target-option">
-                <input id="target-deepseek" type="checkbox" name="target-sites" value="deepseek" />
+                <input id="agent-deepseek" type="checkbox" name="agent-sites" value="deepseek" />
                 <span>DeepSeek</span>
               </label>
               <label class="target-option">
-                <input id="target-gemini" type="checkbox" name="target-sites" value="gemini" />
+                <input id="agent-gemini" type="checkbox" name="agent-sites" value="gemini" />
                 <span>Gemini</span>
               </label>
             </div>
           </div>
           <div class="target-action">
             <button class="ui-btn ui-btn-primary" type="submit">保存目标设置</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="ui-card ui-section ui-stack">
+        <h2>同步目标</h2>
+        <form id="sync-form" class="ui-grid">
+          <div>
+            <label class="ui-label" for="sync-provider">同步目标类型</label>
+            <select class="ui-input" id="sync-provider">
+              <option value="disabled">关闭同步</option>
+              <option value="webhook">Webhook</option>
+              <option value="obsidian">Obsidian Local REST API</option>
+            </select>
+          </div>
+
+          <div id="sync-webhook-fields" class="sync-provider-fields ui-grid">
+            <div>
+              <label class="ui-label" for="sync-webhook-url">Webhook URL</label>
+              <input class="ui-input" id="sync-webhook-url" type="url" placeholder="https://example.com/hooks/ai-response" />
+            </div>
+            <div>
+              <label class="ui-label" for="sync-webhook-auth-token">Webhook Bearer Token（可选）</label>
+              <input class="ui-input" id="sync-webhook-auth-token" type="password" autocomplete="off" />
+            </div>
+          </div>
+
+          <div id="sync-obsidian-fields" class="sync-provider-fields ui-grid">
+            <div>
+              <label class="ui-label" for="sync-obsidian-base-url">Obsidian API Base URL</label>
+              <input class="ui-input" id="sync-obsidian-base-url" type="url" placeholder="https://127.0.0.1:27124" />
+            </div>
+            <div>
+              <label class="ui-label" for="sync-obsidian-api-key">Obsidian API Key</label>
+              <input class="ui-input" id="sync-obsidian-api-key" type="password" autocomplete="off" />
+            </div>
+            <p class="sync-provider-hint">
+              每条 AI 回复会创建为一个新 note，路径在 <code>Daily/OmniStitch/YYYY-MM-DD/{article-title}/{agent}/</code> 下。
+            </p>
+          </div>
+
+          <div class="sync-switches">
+            <label class="switch-item">
+              <input id="sync-auto-sync" type="checkbox" />
+              <span>自动同步（默认开启）</span>
+            </label>
+            <label class="switch-item">
+              <input id="sync-retry-enabled" type="checkbox" />
+              <span>失败重试（默认开启）</span>
+            </label>
+          </div>
+
+          <div>
+            <button class="ui-btn ui-btn-primary" type="submit">保存同步配置</button>
           </div>
         </form>
       </section>

@@ -1,11 +1,17 @@
 const STORAGE_KEY = 'prompt_store_v1';
 const TARGET_STORE_KEY = 'target_site_v1';
+const SYNC_TARGET_SETTINGS_KEY = 'sync_target_settings_v1';
 const VALID_TARGET_SITES = ['chatgpt', 'kimi', 'deepseek', 'gemini'];
 const TARGET_SITE_LABELS = {
   chatgpt: 'ChatGPT',
   kimi: 'Kimi',
   deepseek: 'DeepSeek',
   gemini: 'Gemini'
+};
+const SYNC_PROVIDER_IDS = {
+  DISABLED: 'disabled',
+  WEBHOOK: 'webhook',
+  OBSIDIAN: 'obsidian'
 };
 
 /**
@@ -45,6 +51,35 @@ function createDefaultTargetSettings() {
 }
 
 /**
+ * Creates default sync-target settings.
+ * @returns {{provider:string,autoSync:boolean,retryEnabled:boolean,webhookUrl:string,webhookAuthToken:string,obsidianBaseUrl:string,obsidianApiKey:string}}
+ */
+function createDefaultSyncTargetSettings() {
+  return {
+    provider: SYNC_PROVIDER_IDS.DISABLED,
+    autoSync: true,
+    retryEnabled: true,
+    webhookUrl: '',
+    webhookAuthToken: '',
+    obsidianBaseUrl: 'https://127.0.0.1:27124',
+    obsidianApiKey: ''
+  };
+}
+
+/**
+ * Checks whether one provider id is supported.
+ * @param {string|undefined} provider
+ * @returns {boolean}
+ */
+function isValidProvider(provider) {
+  return (
+    provider === SYNC_PROVIDER_IDS.DISABLED ||
+    provider === SYNC_PROVIDER_IDS.WEBHOOK ||
+    provider === SYNC_PROVIDER_IDS.OBSIDIAN
+  );
+}
+
+/**
  * Normalizes target settings and keeps backward compatibility with old single-target schema.
  * @param {{targetSites?: string[], targetSite?: string}|undefined} settings
  * @returns {{targetSites: Array<'chatgpt'|'kimi'|'deepseek'|'gemini'>}}
@@ -72,6 +107,39 @@ function normalizeTargetSettings(settings) {
 
   return {
     targetSites: Array.from(normalizedSet)
+  };
+}
+
+/**
+ * Normalizes sync-target settings using current schema only.
+ * @param {Record<string, unknown>|undefined} settings
+ * @returns {{provider:string,autoSync:boolean,retryEnabled:boolean,webhookUrl:string,webhookAuthToken:string,obsidianBaseUrl:string,obsidianApiKey:string}}
+ */
+function normalizeSyncTargetSettings(settings) {
+  const defaults = createDefaultSyncTargetSettings();
+  const data = settings && typeof settings === 'object' ? settings : {};
+
+  const rawProvider = typeof data.provider === 'string' ? data.provider.trim() : '';
+  const webhookUrl = typeof data.webhookUrl === 'string' ? data.webhookUrl.trim() : defaults.webhookUrl;
+  const webhookAuthToken =
+    typeof data.webhookAuthToken === 'string' ? data.webhookAuthToken.trim() : defaults.webhookAuthToken;
+  const obsidianBaseUrl =
+    typeof data.obsidianBaseUrl === 'string' ? data.obsidianBaseUrl.trim() : defaults.obsidianBaseUrl;
+  const obsidianApiKey =
+    typeof data.obsidianApiKey === 'string' ? data.obsidianApiKey.trim() : defaults.obsidianApiKey;
+  const autoSync = typeof data.autoSync === 'boolean' ? data.autoSync : defaults.autoSync;
+  const retryEnabled = typeof data.retryEnabled === 'boolean' ? data.retryEnabled : defaults.retryEnabled;
+
+  const provider = isValidProvider(rawProvider) ? rawProvider : defaults.provider;
+
+  return {
+    provider,
+    autoSync,
+    retryEnabled,
+    webhookUrl,
+    webhookAuthToken,
+    obsidianBaseUrl,
+    obsidianApiKey
   };
 }
 
@@ -111,11 +179,12 @@ async function loadTargetSettings() {
   try {
     const data = await chrome.storage.local.get(TARGET_STORE_KEY);
     const normalized = normalizeTargetSettings(data[TARGET_STORE_KEY]);
+    const raw = data[TARGET_STORE_KEY];
     const hasSameShape =
-      data[TARGET_STORE_KEY] &&
-      Array.isArray(data[TARGET_STORE_KEY].targetSites) &&
-      data[TARGET_STORE_KEY].targetSites.length === normalized.targetSites.length &&
-      data[TARGET_STORE_KEY].targetSites.every((site) => normalized.targetSites.includes(site));
+      raw &&
+      Array.isArray(raw.targetSites) &&
+      raw.targetSites.length === normalized.targetSites.length &&
+      raw.targetSites.every((site) => normalized.targetSites.includes(site));
 
     if (!hasSameShape) {
       await chrome.storage.local.set({ [TARGET_STORE_KEY]: normalized });
@@ -127,6 +196,38 @@ async function loadTargetSettings() {
     const defaultSettings = createDefaultTargetSettings();
     await chrome.storage.local.set({ [TARGET_STORE_KEY]: defaultSettings });
     return defaultSettings;
+  }
+}
+
+/**
+ * Loads sync-target settings from extension local storage.
+ * @returns {Promise<{provider:string,autoSync:boolean,retryEnabled:boolean,webhookUrl:string,webhookAuthToken:string,obsidianBaseUrl:string,obsidianApiKey:string}>}
+ */
+async function loadSyncTargetSettings() {
+  try {
+    const data = await chrome.storage.local.get(SYNC_TARGET_SETTINGS_KEY);
+    const normalized = normalizeSyncTargetSettings(data[SYNC_TARGET_SETTINGS_KEY]);
+    const raw = data[SYNC_TARGET_SETTINGS_KEY];
+    const hasSameShape =
+      raw &&
+      raw.provider === normalized.provider &&
+      raw.autoSync === normalized.autoSync &&
+      raw.retryEnabled === normalized.retryEnabled &&
+      raw.webhookUrl === normalized.webhookUrl &&
+      raw.webhookAuthToken === normalized.webhookAuthToken &&
+      raw.obsidianBaseUrl === normalized.obsidianBaseUrl &&
+      raw.obsidianApiKey === normalized.obsidianApiKey;
+
+    if (!hasSameShape) {
+      await chrome.storage.local.set({ [SYNC_TARGET_SETTINGS_KEY]: normalized });
+    }
+
+    return normalized;
+  } catch (error) {
+    console.error('Failed to load sync target settings:', error);
+    const defaults = createDefaultSyncTargetSettings();
+    await chrome.storage.local.set({ [SYNC_TARGET_SETTINGS_KEY]: defaults });
+    return defaults;
   }
 }
 
@@ -156,6 +257,31 @@ async function saveTargetSettings(settings) {
     console.error('Failed to save target settings:', error);
     throw error;
   }
+}
+
+/**
+ * Saves sync-target settings to extension local storage.
+ * @param {{provider:string,autoSync:boolean,retryEnabled:boolean,webhookUrl:string,webhookAuthToken:string,obsidianBaseUrl:string,obsidianApiKey:string}} settings
+ * @returns {Promise<void>}
+ */
+async function saveSyncTargetSettings(settings) {
+  try {
+    await chrome.storage.local.set({ [SYNC_TARGET_SETTINGS_KEY]: settings });
+  } catch (error) {
+    console.error('Failed to save sync target settings:', error);
+    throw error;
+  }
+}
+
+/**
+ * Renders sync provider-specific fields.
+ * @param {string} provider
+ * @param {HTMLElement} webhookFields
+ * @param {HTMLElement} obsidianFields
+ */
+function renderSyncProviderFields(provider, webhookFields, obsidianFields) {
+  webhookFields.hidden = provider !== SYNC_PROVIDER_IDS.WEBHOOK;
+  obsidianFields.hidden = provider !== SYNC_PROVIDER_IDS.OBSIDIAN;
 }
 
 /**
@@ -265,13 +391,39 @@ function setStatus(message) {
  * Initializes options page and event handlers.
  */
 async function init() {
-  const targetForm = document.getElementById('target-form');
-  const targetSiteCheckboxes = document.querySelectorAll('input[name="target-sites"]');
+  const targetForm = document.getElementById('agent-form');
+  const targetSiteCheckboxes = document.querySelectorAll('input[name="agent-sites"]');
+  const syncForm = document.getElementById('sync-form');
+  const syncProviderSelect = document.getElementById('sync-provider');
+  const syncAutoSyncInput = document.getElementById('sync-auto-sync');
+  const syncRetryEnabledInput = document.getElementById('sync-retry-enabled');
+  const syncWebhookUrlInput = document.getElementById('sync-webhook-url');
+  const syncWebhookAuthTokenInput = document.getElementById('sync-webhook-auth-token');
+  const syncObsidianBaseUrlInput = document.getElementById('sync-obsidian-base-url');
+  const syncObsidianApiKeyInput = document.getElementById('sync-obsidian-api-key');
+  const syncWebhookFields = document.getElementById('sync-webhook-fields');
+  const syncObsidianFields = document.getElementById('sync-obsidian-fields');
   const form = document.getElementById('create-form');
   const titleInput = document.getElementById('prompt-title');
   const contentInput = document.getElementById('prompt-content');
 
-  if (!targetForm || targetSiteCheckboxes.length === 0 || !form || !titleInput || !contentInput) {
+  if (
+    !targetForm ||
+    targetSiteCheckboxes.length === 0 ||
+    !(syncForm instanceof HTMLFormElement) ||
+    !(syncProviderSelect instanceof HTMLSelectElement) ||
+    !(syncAutoSyncInput instanceof HTMLInputElement) ||
+    !(syncRetryEnabledInput instanceof HTMLInputElement) ||
+    !(syncWebhookUrlInput instanceof HTMLInputElement) ||
+    !(syncWebhookAuthTokenInput instanceof HTMLInputElement) ||
+    !(syncObsidianBaseUrlInput instanceof HTMLInputElement) ||
+    !(syncObsidianApiKeyInput instanceof HTMLInputElement) ||
+    !(syncWebhookFields instanceof HTMLElement) ||
+    !(syncObsidianFields instanceof HTMLElement) ||
+    !form ||
+    !titleInput ||
+    !contentInput
+  ) {
     console.error('Required options page nodes are missing.');
     return;
   }
@@ -280,6 +432,22 @@ async function init() {
   for (const checkbox of targetSiteCheckboxes) {
     checkbox.checked = targetSettings.targetSites.includes(checkbox.value);
   }
+
+  const syncSettings = await loadSyncTargetSettings();
+  syncProviderSelect.value = isValidProvider(syncSettings.provider)
+    ? syncSettings.provider
+    : SYNC_PROVIDER_IDS.DISABLED;
+  syncAutoSyncInput.checked = syncSettings.autoSync;
+  syncRetryEnabledInput.checked = syncSettings.retryEnabled;
+  syncWebhookUrlInput.value = syncSettings.webhookUrl;
+  syncWebhookAuthTokenInput.value = syncSettings.webhookAuthToken;
+  syncObsidianBaseUrlInput.value = syncSettings.obsidianBaseUrl;
+  syncObsidianApiKeyInput.value = syncSettings.obsidianApiKey;
+  renderSyncProviderFields(syncProviderSelect.value, syncWebhookFields, syncObsidianFields);
+
+  syncProviderSelect.addEventListener('change', () => {
+    renderSyncProviderFields(syncProviderSelect.value, syncWebhookFields, syncObsidianFields);
+  });
 
   targetForm.addEventListener('submit', async (event) => {
     event.preventDefault();
@@ -290,16 +458,82 @@ async function init() {
       .filter((site) => VALID_TARGET_SITES.includes(site));
 
     if (selectedValues.length === 0) {
-      setStatus('请至少选择一个发送目标。');
+      setStatus('请至少选择一个发送 Agent。');
       return;
     }
 
     try {
       await saveTargetSettings({ targetSites: selectedValues });
       const targetLabels = selectedValues.map((site) => TARGET_SITE_LABELS[site] || site);
-      setStatus(`已保存跳转目标：${targetLabels.join('、')}`);
+      setStatus(`已保存 Agent：${targetLabels.join('、')}`);
     } catch (error) {
-      setStatus('保存跳转目标失败，请重试。');
+      setStatus('保存 Agent 失败，请重试。');
+    }
+  });
+
+  syncForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+
+    const provider = isValidProvider(syncProviderSelect.value)
+      ? syncProviderSelect.value
+      : SYNC_PROVIDER_IDS.DISABLED;
+    const webhookUrl = syncWebhookUrlInput.value.trim();
+    const webhookAuthToken = syncWebhookAuthTokenInput.value.trim();
+    const obsidianBaseUrl = syncObsidianBaseUrlInput.value.trim();
+    const obsidianApiKey = syncObsidianApiKeyInput.value.trim();
+    const autoSync = syncAutoSyncInput.checked;
+    const retryEnabled = syncRetryEnabledInput.checked;
+
+    if (provider === SYNC_PROVIDER_IDS.WEBHOOK) {
+      if (!webhookUrl) {
+        setStatus('使用 Webhook 同步时，请填写 Webhook URL。');
+        return;
+      }
+
+      try {
+        const parsed = new URL(webhookUrl);
+        if (!/^https?:$/i.test(parsed.protocol)) {
+          setStatus('Webhook URL 仅支持 http/https 协议。');
+          return;
+        }
+      } catch (error) {
+        setStatus('Webhook URL 格式不正确。');
+        return;
+      }
+    }
+
+    if (provider === SYNC_PROVIDER_IDS.OBSIDIAN) {
+      if (!obsidianBaseUrl || !obsidianApiKey) {
+        setStatus('使用 Obsidian 同步时，请填写 API Base URL 与 API Key。');
+        return;
+      }
+
+      try {
+        const parsed = new URL(obsidianBaseUrl);
+        if (!/^https?:$/i.test(parsed.protocol)) {
+          setStatus('Obsidian Base URL 仅支持 http/https 协议。');
+          return;
+        }
+      } catch (error) {
+        setStatus('Obsidian Base URL 格式不正确。');
+        return;
+      }
+    }
+
+    try {
+      const normalized = normalizeSyncTargetSettings({
+        provider,
+        autoSync,
+        retryEnabled,
+        webhookUrl,
+        webhookAuthToken,
+        obsidianBaseUrl,
+        obsidianApiKey
+      });
+      await saveSyncTargetSettings(normalized);
+      setStatus('已保存同步目标配置。');
+    } catch (error) {
+      setStatus('保存同步目标配置失败，请重试。');
     }
   });
 

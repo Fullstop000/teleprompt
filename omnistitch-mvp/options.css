@@ -50,6 +50,32 @@ h2 {
   justify-content: flex-end;
 }
 
+.sync-provider-fields[hidden] {
+  display: none;
+}
+
+.sync-switches {
+  display: grid;
+  gap: 8px;
+}
+
+.switch-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.switch-item input[type='checkbox'] {
+  width: 16px;
+  height: 16px;
+}
+
+.sync-provider-hint {
+  margin: 0 0 4px;
+  font-size: 13px;
+  color: var(--ui-muted);
+}
+
 .status {
   min-height: 20px;
   margin: 0;

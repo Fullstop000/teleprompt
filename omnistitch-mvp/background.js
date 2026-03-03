@@ -1,11 +1,45 @@
+try {
+  importScripts('webhook-provider.js');
+} catch (error) {
+  console.error('Failed to load webhook provider script:', error);
+}
+try {
+  importScripts('obsidian-provider.js');
+} catch (error) {
+  console.error('Failed to load obsidian provider script:', error);
+}
+
 const PROMPT_STORE_KEY = 'prompt_store_v1';
 const TARGET_STORE_KEY = 'target_site_v1';
+const SYNC_TARGET_SETTINGS_KEY = 'sync_target_settings_v1';
+const SYNC_RETRY_QUEUE_KEY = 'sync_retry_queue_v1';
 const MESSAGE_ACTION = 'omnistitch_auto_send';
+const AI_RESPONSE_REPORT_ACTION = 'omnistitch_ai_response_report';
 const DEFAULT_TARGET_SITE = 'chatgpt';
 const PROMPT_PARAM = 'q';
+const TASK_PARAM = 'omnistitch_task';
+const SOURCE_URL_PARAM = 'omnistitch_source';
+const SOURCE_TITLE_PARAM = 'omnistitch_title';
+const CAPTURE_DUMP_PARAM = 'omnistitch_capture_dump';
 const MESSAGE_RETRY_LIMIT = 8;
 const MESSAGE_RETRY_DELAY_MS = 600;
+const CAPTURE_NETWORK_TRACK_START_ACTION = 'omnistitch_capture_network_track_start';
+const CAPTURE_NETWORK_TRACK_STOP_ACTION = 'omnistitch_capture_network_track_stop';
+const CAPTURE_NETWORK_WAIT_IDLE_ACTION = 'omnistitch_capture_network_wait_idle';
+const CAPTURE_NETWORK_IDLE_WINDOW_MS = 1600;
+const CAPTURE_NETWORK_WAIT_TIMEOUT_MS = 7000;
+const CAPTURE_NETWORK_WAIT_POLL_MS = 200;
+const KIMI_CHAT_SERVICE_PATH = '/apiv2/kimi.gateway.chat.v1.chatservice/chat';
+const URL_KEYWORDS = ['chat', 'conversation', 'assistant', 'completion', 'generate', 'response', 'stream'];
+const SYNC_RETRY_ALARM_NAME = 'omnistitch_sync_retry_alarm';
+const SYNC_RETRY_DELAY_MINUTES = 5;
+const SYNC_RETRY_MAX_ATTEMPTS = 20;
 const BG_LOG_PREFIX = '[omnistitch][bg]';
+const SYNC_PROVIDER_IDS = {
+  DISABLED: 'disabled',
+  WEBHOOK: 'webhook',
+  OBSIDIAN: 'obsidian'
+};
 const TARGET_SITE_CONFIGS = {
   chatgpt: {
     id: 'chatgpt',
@@ -32,6 +66,28 @@ const TARGET_SITE_CONFIGS = {
     promptParam: null
   }
 };
+/**
+ * Active webRequest tracking sessions keyed by task id.
+ * @type {Map<string, {
+ *   taskId:string,
+ *   tabId:number,
+ *   targetSite:string,
+ *   startedAt:number,
+ *   lastActivityAt:number,
+ *   matchedRequestCount:number,
+ *   completedRequestCount:number,
+ *   inflightRequestIds:Set<string>,
+ *   requestUrlByRequestId:Map<string,string>,
+ *   lastMatchedUrl:string
+ * }>}
+ */
+const webRequestTrackingSessionsByTaskId = new Map();
+
+/**
+ * Reverse index to resolve active task id from target tab id.
+ * @type {Map<number, string>}
+ */
+const webRequestTrackingTaskIdByTabId = new Map();
 
 /**
  * Writes a background debug log with a stable prefix.
@@ -39,6 +95,327 @@ const TARGET_SITE_CONFIGS = {
  */
 function logInfo(...args) {
   console.log(BG_LOG_PREFIX, ...args);
+}
+
+/**
+ * Waits for a short duration in async flow.
+ * @param {number} ms
+ * @returns {Promise<void>}
+ */
+async function waitMs(ms) {
+  await new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+/**
+ * Checks whether one URL is Kimi chat service request.
+ * @param {string|undefined} url
+ * @returns {boolean}
+ */
+function isKimiChatServiceUrl(url) {
+  if (typeof url !== 'string' || !url) {
+    return false;
+  }
+
+  return url.toLowerCase().includes(KIMI_CHAT_SERVICE_PATH);
+}
+
+/**
+ * Returns host allowlist for one target site.
+ * @param {string} targetSite
+ * @returns {string[]}
+ */
+function getCaptureHostAllowlist(targetSite) {
+  if (targetSite === 'chatgpt') {
+    return ['chatgpt.com', 'openai.com'];
+  }
+  if (targetSite === 'kimi') {
+    return ['kimi.com', 'moonshot.cn'];
+  }
+  if (targetSite === 'deepseek') {
+    return ['deepseek.com'];
+  }
+  if (targetSite === 'gemini') {
+    return ['gemini.google.com', 'googleapis.com', 'google.com'];
+  }
+
+  return ['chatgpt.com', 'openai.com', 'kimi.com', 'moonshot.cn', 'deepseek.com', 'gemini.google.com', 'googleapis.com', 'google.com'];
+}
+
+/**
+ * Checks whether one request URL should be considered AI-response traffic.
+ * @param {string} requestUrl
+ * @param {string} targetSite
+ * @returns {boolean}
+ */
+function isTrackableCaptureRequestUrl(requestUrl, targetSite) {
+  if (!requestUrl || typeof requestUrl !== 'string') {
+    return false;
+  }
+
+  try {
+    const parsed = new URL(requestUrl);
+    const hostname = parsed.hostname.toLowerCase();
+    const pathAndSearch = `${parsed.pathname}${parsed.search}`.toLowerCase();
+    const allowlist = getCaptureHostAllowlist(targetSite);
+    const hostMatched = allowlist.some((domain) => hostname === domain || hostname.endsWith(`.${domain}`));
+    if (!hostMatched) {
+      return false;
+    }
+
+    if (isKimiChatServiceUrl(parsed.toString())) {
+      return true;
+    }
+
+    return URL_KEYWORDS.some((keyword) => pathAndSearch.includes(keyword));
+  } catch (_error) {
+    return false;
+  }
+}
+
+/**
+ * Stops one webRequest tracking session and clears reverse indexes.
+ * @param {string} taskId
+ * @param {string} reason
+ */
+function stopWebRequestTrackingSession(taskId, reason) {
+  if (!taskId || typeof taskId !== 'string') {
+    return;
+  }
+
+  const session = webRequestTrackingSessionsByTaskId.get(taskId);
+  if (!session) {
+    return;
+  }
+
+  webRequestTrackingSessionsByTaskId.delete(taskId);
+  const indexedTaskId = webRequestTrackingTaskIdByTabId.get(session.tabId);
+  if (indexedTaskId === taskId) {
+    webRequestTrackingTaskIdByTabId.delete(session.tabId);
+  }
+
+  logInfo('Stopped webRequest capture tracking session.', {
+    taskId,
+    tabId: session.tabId,
+    targetSite: session.targetSite,
+    reason,
+    matchedRequestCount: session.matchedRequestCount,
+    completedRequestCount: session.completedRequestCount,
+    inflightCount: session.inflightRequestIds.size
+  });
+}
+
+/**
+ * Starts or replaces one webRequest tracking session.
+ * @param {string} taskId
+ * @param {number} tabId
+ * @param {string} targetSite
+ */
+function startWebRequestTrackingSession(taskId, tabId, targetSite) {
+  if (!taskId || !Number.isInteger(tabId)) {
+    return;
+  }
+
+  const oldTaskId = webRequestTrackingTaskIdByTabId.get(tabId);
+  if (oldTaskId && oldTaskId !== taskId) {
+    stopWebRequestTrackingSession(oldTaskId, 'replaced_by_new_task');
+  }
+  if (webRequestTrackingSessionsByTaskId.has(taskId)) {
+    stopWebRequestTrackingSession(taskId, 'restart');
+  }
+
+  const startedAt = Date.now();
+  webRequestTrackingSessionsByTaskId.set(taskId, {
+    taskId,
+    tabId,
+    targetSite: typeof targetSite === 'string' && targetSite ? targetSite : 'unknown',
+    startedAt,
+    lastActivityAt: startedAt,
+    matchedRequestCount: 0,
+    completedRequestCount: 0,
+    inflightRequestIds: new Set(),
+    requestUrlByRequestId: new Map(),
+    lastMatchedUrl: ''
+  });
+  webRequestTrackingTaskIdByTabId.set(tabId, taskId);
+
+  logInfo('Started webRequest capture tracking session.', {
+    taskId,
+    tabId,
+    targetSite: typeof targetSite === 'string' && targetSite ? targetSite : 'unknown'
+  });
+}
+
+/**
+ * Updates one active tracking session when request starts.
+ * @param {number} tabId
+ * @param {string} requestId
+ * @param {string} requestUrl
+ */
+function onTrackedRequestStarted(tabId, requestId, requestUrl) {
+  const taskId = webRequestTrackingTaskIdByTabId.get(tabId);
+  if (!taskId) {
+    return;
+  }
+
+  const session = webRequestTrackingSessionsByTaskId.get(taskId);
+  if (!session) {
+    return;
+  }
+
+  if (!isTrackableCaptureRequestUrl(requestUrl, session.targetSite)) {
+    return;
+  }
+
+  session.matchedRequestCount += 1;
+  session.lastActivityAt = Date.now();
+  session.lastMatchedUrl = requestUrl;
+  if (requestId) {
+    session.inflightRequestIds.add(requestId);
+    session.requestUrlByRequestId.set(requestId, requestUrl);
+  }
+
+  if (session.matchedRequestCount <= 5 || session.matchedRequestCount % 20 === 0) {
+    logInfo('webRequest matched request start.', {
+      taskId: session.taskId,
+      tabId: session.tabId,
+      targetSite: session.targetSite,
+      requestId,
+      matchedRequestCount: session.matchedRequestCount,
+      inflightCount: session.inflightRequestIds.size,
+      requestUrl
+    });
+  }
+}
+
+/**
+ * Updates one active tracking session when matched request completes or errors.
+ * @param {number} tabId
+ * @param {string} requestId
+ */
+function onTrackedRequestFinished(tabId, requestId) {
+  const taskId = webRequestTrackingTaskIdByTabId.get(tabId);
+  if (!taskId) {
+    return;
+  }
+
+  const session = webRequestTrackingSessionsByTaskId.get(taskId);
+  if (!session) {
+    return;
+  }
+
+  if (!requestId || !session.inflightRequestIds.has(requestId)) {
+    return;
+  }
+
+  session.inflightRequestIds.delete(requestId);
+  const requestUrl = session.requestUrlByRequestId.get(requestId) || '';
+  session.requestUrlByRequestId.delete(requestId);
+  session.completedRequestCount += 1;
+  session.lastActivityAt = Date.now();
+
+  if (session.completedRequestCount <= 5 || session.completedRequestCount % 20 === 0) {
+    logInfo('webRequest matched request finished.', {
+      taskId: session.taskId,
+      tabId: session.tabId,
+      targetSite: session.targetSite,
+      requestId,
+      completedRequestCount: session.completedRequestCount,
+      inflightCount: session.inflightRequestIds.size,
+      requestUrl
+    });
+  }
+}
+
+/**
+ * Waits until one task's tracked request stream becomes idle.
+ * @param {string} taskId
+ * @param {number} timeoutMs
+ * @returns {Promise<{ok:boolean,taskId:string,timedOut:boolean,matchedRequestCount:number,completedRequestCount:number,inflightCount:number,idleForMs:number,lastMatchedUrl:string}>}
+ */
+async function waitForWebRequestTrackingIdle(taskId, timeoutMs = CAPTURE_NETWORK_WAIT_TIMEOUT_MS) {
+  const normalizedTimeout =
+    Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0 ? Number(timeoutMs) : CAPTURE_NETWORK_WAIT_TIMEOUT_MS;
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt <= normalizedTimeout) {
+    const session = webRequestTrackingSessionsByTaskId.get(taskId);
+    if (!session) {
+      return {
+        ok: true,
+        taskId,
+        timedOut: false,
+        matchedRequestCount: 0,
+        completedRequestCount: 0,
+        inflightCount: 0,
+        idleForMs: 0,
+        lastMatchedUrl: ''
+      };
+    }
+
+    const idleForMs = Date.now() - session.lastActivityAt;
+    const inflightCount = session.inflightRequestIds.size;
+    const hasMatchedRequest = session.matchedRequestCount > 0;
+    const idleReached = inflightCount === 0 && idleForMs >= CAPTURE_NETWORK_IDLE_WINDOW_MS;
+    const noMatchGraceReached = !hasMatchedRequest && Date.now() - session.startedAt >= CAPTURE_NETWORK_IDLE_WINDOW_MS;
+    if (idleReached || noMatchGraceReached) {
+      return {
+        ok: true,
+        taskId,
+        timedOut: false,
+        matchedRequestCount: session.matchedRequestCount,
+        completedRequestCount: session.completedRequestCount,
+        inflightCount,
+        idleForMs,
+        lastMatchedUrl: session.lastMatchedUrl
+      };
+    }
+
+    await waitMs(CAPTURE_NETWORK_WAIT_POLL_MS);
+  }
+
+  const finalSession = webRequestTrackingSessionsByTaskId.get(taskId);
+  return {
+    ok: false,
+    taskId,
+    timedOut: true,
+    matchedRequestCount: finalSession ? finalSession.matchedRequestCount : 0,
+    completedRequestCount: finalSession ? finalSession.completedRequestCount : 0,
+    inflightCount: finalSession ? finalSession.inflightRequestIds.size : 0,
+    idleForMs: finalSession ? Date.now() - finalSession.lastActivityAt : 0,
+    lastMatchedUrl: finalSession ? finalSession.lastMatchedUrl : ''
+  };
+}
+
+/**
+ * Handles webRequest start event to track candidate AI traffic per task.
+ * @param {chrome.webRequest.WebRequestBodyDetails} details
+ */
+function handleWebRequestBeforeRequest(details) {
+  const tabId = Number(details?.tabId);
+  if (!Number.isInteger(tabId) || tabId < 0) {
+    return;
+  }
+
+  onTrackedRequestStarted(
+    tabId,
+    typeof details?.requestId === 'string' ? details.requestId : '',
+    typeof details?.url === 'string' ? details.url : ''
+  );
+}
+
+/**
+ * Handles webRequest completion/error events to close inflight request ids.
+ * @param {chrome.webRequest.WebResponseCacheDetails} details
+ */
+function handleWebRequestFinished(details) {
+  const tabId = Number(details?.tabId);
+  if (!Number.isInteger(tabId) || tabId < 0) {
+    return;
+  }
+
+  onTrackedRequestFinished(tabId, typeof details?.requestId === 'string' ? details.requestId : '');
 }
 
 /**
@@ -89,6 +466,36 @@ function createDefaultTargetSettings() {
 }
 
 /**
+ * Creates the default sync-target settings.
+ * disabled means capture is enabled but no external sync provider is active.
+ * @returns {{provider:string,autoSync:boolean,retryEnabled:boolean,webhookUrl:string,webhookAuthToken:string,obsidianBaseUrl:string,obsidianApiKey:string}}
+ */
+function createDefaultSyncTargetSettings() {
+  return {
+    provider: SYNC_PROVIDER_IDS.DISABLED,
+    autoSync: true,
+    retryEnabled: true,
+    webhookUrl: '',
+    webhookAuthToken: '',
+    obsidianBaseUrl: 'https://127.0.0.1:27124',
+    obsidianApiKey: ''
+  };
+}
+
+/**
+ * Checks whether one provider id is supported by current extension build.
+ * @param {string|undefined} provider
+ * @returns {boolean}
+ */
+function isValidProvider(provider) {
+  return (
+    provider === SYNC_PROVIDER_IDS.DISABLED ||
+    provider === SYNC_PROVIDER_IDS.WEBHOOK ||
+    provider === SYNC_PROVIDER_IDS.OBSIDIAN
+  );
+}
+
+/**
  * Normalizes target settings and keeps backward compatibility with old single-target schema.
  * @param {{targetSites?: string[], targetSite?: string}|undefined} settings
  * @returns {{targetSites: string[]}}
@@ -116,6 +523,39 @@ function normalizeTargetSettings(settings) {
 
   return {
     targetSites: Array.from(normalizedSet)
+  };
+}
+
+/**
+ * Normalizes sync-target settings using current schema only.
+ * @param {Record<string, unknown>|undefined} settings
+ * @returns {{provider:string,autoSync:boolean,retryEnabled:boolean,webhookUrl:string,webhookAuthToken:string,obsidianBaseUrl:string,obsidianApiKey:string}}
+ */
+function normalizeSyncTargetSettings(settings) {
+  const defaults = createDefaultSyncTargetSettings();
+  const data = settings && typeof settings === 'object' ? settings : {};
+
+  const rawProvider = typeof data.provider === 'string' ? data.provider.trim() : '';
+  const webhookUrl = typeof data.webhookUrl === 'string' ? data.webhookUrl.trim() : defaults.webhookUrl;
+  const webhookAuthToken =
+    typeof data.webhookAuthToken === 'string' ? data.webhookAuthToken.trim() : defaults.webhookAuthToken;
+  const obsidianBaseUrl =
+    typeof data.obsidianBaseUrl === 'string' ? data.obsidianBaseUrl.trim() : defaults.obsidianBaseUrl;
+  const obsidianApiKey =
+    typeof data.obsidianApiKey === 'string' ? data.obsidianApiKey.trim() : defaults.obsidianApiKey;
+  const autoSync = typeof data.autoSync === 'boolean' ? data.autoSync : defaults.autoSync;
+  const retryEnabled = typeof data.retryEnabled === 'boolean' ? data.retryEnabled : defaults.retryEnabled;
+
+  const provider = isValidProvider(rawProvider) ? rawProvider : defaults.provider;
+
+  return {
+    provider,
+    autoSync,
+    retryEnabled,
+    webhookUrl,
+    webhookAuthToken,
+    obsidianBaseUrl,
+    obsidianApiKey
   };
 }
 
@@ -157,11 +597,12 @@ async function loadTargetSettings() {
   try {
     const data = await chrome.storage.local.get(TARGET_STORE_KEY);
     const normalized = normalizeTargetSettings(data[TARGET_STORE_KEY]);
+    const raw = data[TARGET_STORE_KEY];
     const hasSameShape =
-      data[TARGET_STORE_KEY] &&
-      Array.isArray(data[TARGET_STORE_KEY].targetSites) &&
-      data[TARGET_STORE_KEY].targetSites.length === normalized.targetSites.length &&
-      data[TARGET_STORE_KEY].targetSites.every((site) => normalized.targetSites.includes(site));
+      raw &&
+      Array.isArray(raw.targetSites) &&
+      raw.targetSites.length === normalized.targetSites.length &&
+      raw.targetSites.every((site) => normalized.targetSites.includes(site));
 
     if (!hasSameShape) {
       await chrome.storage.local.set({ [TARGET_STORE_KEY]: normalized });
@@ -173,6 +614,69 @@ async function loadTargetSettings() {
     const defaultSettings = createDefaultTargetSettings();
     await chrome.storage.local.set({ [TARGET_STORE_KEY]: defaultSettings });
     return defaultSettings;
+  }
+}
+
+/**
+ * Loads sync-target settings from current schema.
+ * @returns {Promise<{provider:string,autoSync:boolean,retryEnabled:boolean,webhookUrl:string,webhookAuthToken:string,obsidianBaseUrl:string,obsidianApiKey:string}>}
+ */
+async function loadSyncTargetSettings() {
+  try {
+    const data = await chrome.storage.local.get(SYNC_TARGET_SETTINGS_KEY);
+    const normalized = normalizeSyncTargetSettings(data[SYNC_TARGET_SETTINGS_KEY]);
+    const raw = data[SYNC_TARGET_SETTINGS_KEY];
+    const hasSameShape =
+      raw &&
+      raw.provider === normalized.provider &&
+      raw.autoSync === normalized.autoSync &&
+      raw.retryEnabled === normalized.retryEnabled &&
+      raw.webhookUrl === normalized.webhookUrl &&
+      raw.webhookAuthToken === normalized.webhookAuthToken &&
+      raw.obsidianBaseUrl === normalized.obsidianBaseUrl &&
+      raw.obsidianApiKey === normalized.obsidianApiKey;
+
+    if (!hasSameShape) {
+      await chrome.storage.local.set({ [SYNC_TARGET_SETTINGS_KEY]: normalized });
+    }
+
+    return normalized;
+  } catch (error) {
+    console.error('Failed to load sync target settings:', error);
+    const defaults = createDefaultSyncTargetSettings();
+    await chrome.storage.local.set({ [SYNC_TARGET_SETTINGS_KEY]: defaults });
+    return defaults;
+  }
+}
+
+/**
+ * Loads retry queue from current schema key.
+ * @returns {Promise<Array<{id:string,payload:{taskId:string,targetSite:string,sourceUrl:string,sourceTitle:string,aiResponse:string,capturedAt:string,captureMethod:string,captureChannel:string,captureSourceUrl:string,captureChunkCount:number,captureDurationMs:number,captureDump?:string},providerId:string,attempts:number,lastError:string,updatedAt:string}>>}
+ */
+async function loadSyncRetryQueue() {
+  try {
+    const data = await chrome.storage.local.get(SYNC_RETRY_QUEUE_KEY);
+    if (Array.isArray(data[SYNC_RETRY_QUEUE_KEY])) {
+      return data[SYNC_RETRY_QUEUE_KEY];
+    }
+
+    return [];
+  } catch (error) {
+    console.error('Failed to load sync retry queue:', error);
+    return [];
+  }
+}
+
+/**
+ * Saves sync retry queue into extension storage.
+ * @param {Array<{id:string,payload:{taskId:string,targetSite:string,sourceUrl:string,sourceTitle:string,aiResponse:string,capturedAt:string,captureMethod:string,captureChannel:string,captureSourceUrl:string,captureChunkCount:number,captureDurationMs:number,captureDump?:string},providerId:string,attempts:number,lastError:string,updatedAt:string}>} queue
+ */
+async function saveSyncRetryQueue(queue) {
+  try {
+    await chrome.storage.local.set({ [SYNC_RETRY_QUEUE_KEY]: queue });
+  } catch (error) {
+    console.error('Failed to save sync retry queue:', error);
+    throw error;
   }
 }
 
@@ -233,16 +737,52 @@ function getTargetSiteConfig(targetSite) {
 }
 
 /**
+ * Generates a stable task id for one target dispatch.
+ * @param {string} targetSite
+ * @returns {string}
+ */
+function generateTaskId(targetSite) {
+  const randomPart = Math.random().toString(36).slice(2, 8);
+  return `${Date.now()}_${targetSite}_${randomPart}`;
+}
+
+/**
  * Builds target URL and attaches prompt query payload when supported.
  * @param {{id: string, name: string, baseUrl: string, promptParam: string|null}} targetConfig
  * @param {string} finalText
+ * @param {{taskId: string}} taskContext
+ * @param {{enableCaptureDump:boolean}} options
  * @returns {string}
  */
-function buildTargetUrl(targetConfig, finalText) {
+function buildTargetUrl(targetConfig, finalText, taskContext, options) {
   try {
     const url = new URL(targetConfig.baseUrl);
+    if (targetConfig.id === 'chatgpt') {
+      // Force ChatGPT temporary chat mode to avoid polluting normal conversation history.
+      url.searchParams.set('temporary-chat', 'true');
+    }
+
     if (targetConfig.promptParam) {
       url.searchParams.set(targetConfig.promptParam, finalText);
+    }
+
+    if (taskContext && typeof taskContext.taskId === 'string' && taskContext.taskId) {
+      url.searchParams.set(TASK_PARAM, taskContext.taskId);
+    }
+
+    if (taskContext && typeof taskContext.sourceUrl === 'string' && taskContext.sourceUrl) {
+      url.searchParams.set(SOURCE_URL_PARAM, taskContext.sourceUrl);
+    }
+
+    if (taskContext && typeof taskContext.sourceTitle === 'string' && taskContext.sourceTitle) {
+      // Keep title query payload bounded to reduce URL explosion risk.
+      const safeTitle = taskContext.sourceTitle.slice(0, 300);
+      url.searchParams.set(SOURCE_TITLE_PARAM, safeTitle);
+    }
+
+    // Capture dump query is enabled only in test-triggered runs.
+    if (options.enableCaptureDump === true) {
+      url.searchParams.set(CAPTURE_DUMP_PARAM, '1');
     }
 
     return url.toString();
@@ -253,17 +793,393 @@ function buildTargetUrl(targetConfig, finalText) {
 }
 
 /**
+ * Resolves the active sync provider id from settings.
+ * @param {{provider: string}} settings
+ * @returns {string}
+ */
+function resolveActiveProvider(settings) {
+  if (settings && isValidProvider(settings.provider)) {
+    return settings.provider;
+  }
+
+  return SYNC_PROVIDER_IDS.DISABLED;
+}
+
+/**
+ * Checks whether selected sync provider has required credentials.
+ * @param {{webhookUrl:string,obsidianBaseUrl:string,obsidianApiKey:string}} settings
+ * @param {string} providerId
+ * @returns {boolean}
+ */
+function hasProviderCredentials(settings, providerId) {
+  if (providerId === SYNC_PROVIDER_IDS.DISABLED) {
+    return true;
+  }
+
+  if (providerId === SYNC_PROVIDER_IDS.WEBHOOK) {
+    return Boolean(settings.webhookUrl);
+  }
+
+  if (providerId === SYNC_PROVIDER_IDS.OBSIDIAN) {
+    return Boolean(settings.obsidianBaseUrl && settings.obsidianApiKey);
+  }
+
+  return false;
+}
+
+/**
+ * Creates human-readable credential error for active provider.
+ * @param {string} providerId
+ * @returns {string}
+ */
+function buildProviderCredentialError(providerId) {
+  if (providerId === SYNC_PROVIDER_IDS.WEBHOOK) {
+    return 'Webhook URL is not configured.';
+  }
+
+  if (providerId === SYNC_PROVIDER_IDS.OBSIDIAN) {
+    return 'Obsidian baseUrl/apiKey is not configured.';
+  }
+
+  return 'Sync provider is not configured.';
+}
+
+/**
+ * Normalizes one AI response report payload before syncing.
+ * @param {{taskId?: string, targetSite?: string, agentSite?: string, sourceUrl?: string, sourceTitle?: string, aiResponse?: string, capturedAt?: string, captureMethod?: string, captureChannel?: string, captureSourceUrl?: string, captureChunkCount?: number|string, captureDurationMs?: number|string, captureDump?: string}} message
+ * @returns {{taskId: string, targetSite: string, sourceUrl: string, sourceTitle: string, aiResponse: string, capturedAt: string, captureMethod: string, captureChannel: string, captureSourceUrl: string, captureChunkCount: number, captureDurationMs: number, captureDump?: string}}
+ */
+function normalizeAiResponsePayload(message) {
+  const taskId = typeof message.taskId === 'string' ? message.taskId.trim() : '';
+  if (!taskId) {
+    throw new Error('Missing taskId for AI response report.');
+  }
+
+  const targetSiteCandidate =
+    typeof message.agentSite === 'string' && message.agentSite.trim()
+      ? message.agentSite.trim()
+      : typeof message.targetSite === 'string' && message.targetSite.trim()
+        ? message.targetSite.trim()
+        : 'unknown';
+  const targetSite = targetSiteCandidate;
+  const sourceUrl = typeof message.sourceUrl === 'string' ? message.sourceUrl.trim() : '';
+  const sourceTitle = typeof message.sourceTitle === 'string' ? message.sourceTitle.trim() : '';
+  const aiResponse = typeof message.aiResponse === 'string' ? message.aiResponse.trim() : '';
+  if (!aiResponse) {
+    throw new Error('AI response content is empty.');
+  }
+
+  const capturedDate = new Date(message.capturedAt || Date.now());
+  const capturedAt = Number.isNaN(capturedDate.getTime()) ? new Date().toISOString() : capturedDate.toISOString();
+  const captureMethod =
+    typeof message.captureMethod === 'string' && message.captureMethod.trim()
+      ? message.captureMethod.trim()
+      : 'unknown';
+  const captureChannel =
+    typeof message.captureChannel === 'string' && message.captureChannel.trim()
+      ? message.captureChannel.trim()
+      : 'unknown';
+  const captureSourceUrl =
+    typeof message.captureSourceUrl === 'string' && message.captureSourceUrl.trim()
+      ? message.captureSourceUrl.trim()
+      : '';
+  const captureChunkCountValue = Number(message.captureChunkCount);
+  const captureDurationMsValue = Number(message.captureDurationMs);
+  const captureDump = typeof message.captureDump === 'string' && message.captureDump.trim() ? message.captureDump : '';
+  const captureChunkCount =
+    Number.isFinite(captureChunkCountValue) && captureChunkCountValue >= 0 ? captureChunkCountValue : 0;
+  const captureDurationMs =
+    Number.isFinite(captureDurationMsValue) && captureDurationMsValue >= 0 ? captureDurationMsValue : 0;
+  const normalizedPayload = {
+    taskId,
+    targetSite,
+    sourceUrl,
+    sourceTitle,
+    aiResponse,
+    capturedAt,
+    captureMethod,
+    captureChannel,
+    captureSourceUrl,
+    captureChunkCount,
+    captureDurationMs
+  };
+  if (captureDump) {
+    normalizedPayload.captureDump = captureDump;
+  }
+
+  return normalizedPayload;
+}
+
+/**
+ * Reads optional capture dump length from normalized payload.
+ * @param {{captureDump?: string}} payload
+ * @returns {number}
+ */
+function getCaptureDumpLength(payload) {
+  if (!payload || typeof payload.captureDump !== 'string') {
+    return 0;
+  }
+
+  return payload.captureDump.length;
+}
+
+/**
+ * Reads webhook provider API from service worker global scope.
+ * @returns {{sync: Function}}
+ */
+function getWebhookProvider() {
+  const provider = self.OmnistitchWebhookProvider;
+  if (!provider || typeof provider.sync !== 'function') {
+    throw new Error('Webhook provider is unavailable.');
+  }
+
+  return provider;
+}
+
+/**
+ * Reads Obsidian provider API from service worker global scope.
+ * @returns {{sync: Function}}
+ */
+function getObsidianProvider() {
+  const provider = self.OmnistitchObsidianProvider;
+  if (!provider || typeof provider.sync !== 'function') {
+    throw new Error('Obsidian provider is unavailable.');
+  }
+
+  return provider;
+}
+
+/**
+ * Dispatches sync payload to active provider implementation.
+ * @param {{taskId: string, targetSite: string, sourceUrl: string, sourceTitle: string, aiResponse: string, capturedAt: string, captureMethod: string, captureChannel: string, captureSourceUrl: string, captureChunkCount: number, captureDurationMs: number, captureDump?: string}} payload
+ * @param {{provider:string,webhookUrl:string,webhookAuthToken:string,obsidianBaseUrl:string,obsidianApiKey:string}} settings
+ * @param {string} providerId
+ */
+async function syncPayloadToProvider(payload, settings, providerId) {
+  if (providerId === SYNC_PROVIDER_IDS.WEBHOOK) {
+    const webhookProvider = getWebhookProvider();
+    await webhookProvider.sync(payload, settings);
+    return;
+  }
+
+  if (providerId === SYNC_PROVIDER_IDS.OBSIDIAN) {
+    const obsidianProvider = getObsidianProvider();
+    await obsidianProvider.sync(payload, settings);
+    return;
+  }
+
+  if (providerId === SYNC_PROVIDER_IDS.DISABLED) {
+    return;
+  }
+
+  throw new Error(`Unsupported sync provider: ${providerId}`);
+}
+
+/**
+ * Adds one failed payload into local retry queue.
+ * @param {{taskId: string, targetSite: string, sourceUrl: string, sourceTitle: string, aiResponse: string, capturedAt: string, captureMethod: string, captureChannel: string, captureSourceUrl: string, captureChunkCount: number, captureDurationMs: number, captureDump?: string}} payload
+ * @param {string} providerId
+ * @param {string} lastError
+ */
+async function enqueueSyncRetry(payload, providerId, lastError) {
+  const queue = await loadSyncRetryQueue();
+  const retryItem = {
+    id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    payload,
+    providerId,
+    attempts: 0,
+    lastError,
+    updatedAt: new Date().toISOString()
+  };
+  queue.push(retryItem);
+
+  await saveSyncRetryQueue(queue);
+  logInfo('Sync retry item enqueued.', {
+    retryId: retryItem.id,
+    taskId: payload.taskId,
+    providerId,
+    queueSize: queue.length,
+    lastError
+  });
+  await scheduleSyncRetryAlarm();
+}
+
+/**
+ * Ensures retry alarm matches current queue and sync settings.
+ */
+async function scheduleSyncRetryAlarm() {
+  try {
+    const settings = await loadSyncTargetSettings();
+    const queue = await loadSyncRetryQueue();
+
+    if (!settings.retryEnabled || queue.length === 0) {
+      chrome.alarms.clear(SYNC_RETRY_ALARM_NAME);
+      return;
+    }
+
+    chrome.alarms.create(SYNC_RETRY_ALARM_NAME, {
+      delayInMinutes: SYNC_RETRY_DELAY_MINUTES,
+      periodInMinutes: SYNC_RETRY_DELAY_MINUTES
+    });
+  } catch (error) {
+    console.error('Failed to schedule sync retry alarm:', error);
+  }
+}
+
+/**
+ * Tries to flush queued payloads to current sync provider.
+ */
+async function retryQueuedSync() {
+  const settings = await loadSyncTargetSettings();
+  const queue = await loadSyncRetryQueue();
+  if (queue.length === 0) {
+    await scheduleSyncRetryAlarm();
+    return;
+  }
+
+  if (!settings.retryEnabled) {
+    await scheduleSyncRetryAlarm();
+    return;
+  }
+
+  const activeProvider = resolveActiveProvider(settings);
+  const nextQueue = [];
+  for (const item of queue) {
+    const attempts = Number.isFinite(item.attempts) ? item.attempts : 0;
+    if (attempts >= SYNC_RETRY_MAX_ATTEMPTS) {
+      console.error('Dropping retry item due to max attempts.', {
+        taskId: item.payload?.taskId || null,
+        attempts,
+        providerId: item.providerId || null
+      });
+      continue;
+    }
+
+    const providerId = typeof item.providerId === 'string' ? item.providerId : activeProvider;
+    if (providerId !== activeProvider) {
+      nextQueue.push(item);
+      continue;
+    }
+
+    if (activeProvider === SYNC_PROVIDER_IDS.DISABLED || !hasProviderCredentials(settings, activeProvider)) {
+      nextQueue.push(item);
+      continue;
+    }
+
+    try {
+      const payload = normalizeAiResponsePayload(item.payload || {});
+      await syncPayloadToProvider(payload, settings, activeProvider);
+    } catch (error) {
+      nextQueue.push({
+        ...item,
+        attempts: attempts + 1,
+        lastError: String(error),
+        updatedAt: new Date().toISOString()
+      });
+    }
+  }
+
+  await saveSyncRetryQueue(nextQueue);
+  await scheduleSyncRetryAlarm();
+}
+
+/**
+ * Handles one AI response report from content scripts.
+ * @param {{taskId?: string, targetSite?: string, sourceUrl?: string, sourceTitle?: string, aiResponse?: string, capturedAt?: string, captureMethod?: string, captureChannel?: string, captureSourceUrl?: string, captureChunkCount?: number|string, captureDurationMs?: number|string, captureDump?: string}} message
+ * @returns {Promise<{ok: boolean, queued?: boolean, skipped?: boolean, error?: string}>}
+ */
+async function handleAiResponseReport(message) {
+  const payload = normalizeAiResponsePayload(message);
+  stopWebRequestTrackingSession(payload.taskId, 'report_received');
+  const syncSettings = await loadSyncTargetSettings();
+  const providerId = resolveActiveProvider(syncSettings);
+
+  logInfo('AI response report received.', {
+    taskId: payload.taskId,
+    targetSite: payload.targetSite,
+    providerId,
+    autoSync: syncSettings.autoSync,
+    retryEnabled: syncSettings.retryEnabled,
+    responseLength: payload.aiResponse.length,
+    sourceUrl: payload.sourceUrl || null,
+    sourceTitle: payload.sourceTitle || null,
+    captureMethod: payload.captureMethod,
+    captureChannel: payload.captureChannel,
+    captureSourceUrl: payload.captureSourceUrl || null,
+    captureChunkCount: payload.captureChunkCount,
+    captureDurationMs: payload.captureDurationMs,
+    captureDumpLength: getCaptureDumpLength(payload)
+  });
+
+  if (!syncSettings.autoSync || providerId === SYNC_PROVIDER_IDS.DISABLED) {
+    logInfo('AI response sync skipped by settings.', {
+      taskId: payload.taskId,
+      providerId,
+      autoSync: syncSettings.autoSync
+    });
+    return { ok: true, skipped: true };
+  }
+
+  if (!hasProviderCredentials(syncSettings, providerId)) {
+    const error = buildProviderCredentialError(providerId);
+    console.error('AI response sync blocked by missing provider credentials.', {
+      taskId: payload.taskId,
+      providerId,
+      error
+    });
+    if (syncSettings.retryEnabled) {
+      await enqueueSyncRetry(payload, providerId, error);
+      logInfo('AI response queued due to missing provider credentials.', {
+        taskId: payload.taskId,
+        providerId
+      });
+      return { ok: true, queued: true };
+    }
+
+    return { ok: false, error };
+  }
+
+  try {
+    await syncPayloadToProvider(payload, syncSettings, providerId);
+    logInfo('AI response sync completed.', {
+      taskId: payload.taskId,
+      providerId,
+      targetSite: payload.targetSite,
+      captureMethod: payload.captureMethod,
+      captureChannel: payload.captureChannel,
+      captureChunkCount: payload.captureChunkCount
+    });
+    return { ok: true };
+  } catch (error) {
+    console.error('Failed to sync AI response:', error);
+    if (syncSettings.retryEnabled) {
+      await enqueueSyncRetry(payload, providerId, String(error));
+      logInfo('AI response queued after sync failure.', {
+        taskId: payload.taskId,
+        providerId,
+        error: String(error)
+      });
+      return { ok: true, queued: true };
+    }
+
+    return { ok: false, error: String(error) };
+  }
+}
+
+/**
  * Sends final text payload to target tab via runtime message.
  * Retries are needed because SPA hydration can delay content script readiness.
  * @param {number} tabId
  * @param {string} targetSite
  * @param {string} finalText
+ * @param {{taskId: string, sourceUrl: string, sourceTitle: string}} taskContext
  * @param {number} retry
  */
-function sendTaskMessageToTab(tabId, targetSite, finalText, retry = 0) {
+function sendTaskMessageToTab(tabId, targetSite, finalText, taskContext, retry = 0) {
   logInfo('Sending runtime message to tab.', {
     tabId,
     targetSite,
+    taskId: taskContext.taskId,
     retry,
     payloadLength: finalText.length
   });
@@ -272,7 +1188,10 @@ function sendTaskMessageToTab(tabId, targetSite, finalText, retry = 0) {
     {
       action: MESSAGE_ACTION,
       targetSite,
-      finalText
+      finalText,
+      taskId: taskContext.taskId,
+      sourceUrl: taskContext.sourceUrl,
+      sourceTitle: taskContext.sourceTitle
     },
     (response) => {
       const err = chrome.runtime.lastError;
@@ -287,7 +1206,7 @@ function sendTaskMessageToTab(tabId, targetSite, finalText, retry = 0) {
       }
 
       setTimeout(() => {
-        sendTaskMessageToTab(tabId, targetSite, finalText, retry + 1);
+        sendTaskMessageToTab(tabId, targetSite, finalText, taskContext, retry + 1);
       }, MESSAGE_RETRY_DELAY_MS);
     }
   );
@@ -299,9 +1218,10 @@ function sendTaskMessageToTab(tabId, targetSite, finalText, retry = 0) {
  * @param {string} targetName
  * @param {number} tabId
  * @param {string} finalText
+ * @param {{taskId: string, sourceUrl: string, sourceTitle: string}} taskContext
  */
-function attachTaskDeliveryListener(targetSite, targetName, tabId, finalText) {
-  const handleTabUpdated = (updatedTabId, changeInfo) => {
+function attachTaskDeliveryListener(targetSite, targetName, tabId, finalText, taskContext) {
+  const handleTabUpdated = async (updatedTabId, changeInfo) => {
     if (updatedTabId !== tabId || changeInfo.status !== 'complete') {
       return;
     }
@@ -309,10 +1229,12 @@ function attachTaskDeliveryListener(targetSite, targetName, tabId, finalText) {
     logInfo('Target tab load complete, start task delivery.', {
       targetName,
       targetSite,
-      tabId
+      tabId,
+      taskId: taskContext.taskId
     });
     chrome.tabs.onUpdated.removeListener(handleTabUpdated);
-    sendTaskMessageToTab(tabId, targetSite, finalText);
+
+    sendTaskMessageToTab(tabId, targetSite, finalText, taskContext);
   };
 
   chrome.tabs.onUpdated.addListener(handleTabUpdated);
@@ -322,13 +1244,16 @@ function attachTaskDeliveryListener(targetSite, targetName, tabId, finalText) {
  * Opens target site and schedules task delivery by runtime message.
  * @param {{id: string, name: string, baseUrl: string, promptParam: string|null}} targetConfig
  * @param {string} finalText
+ * @param {{taskId: string, sourceUrl: string, sourceTitle: string}} taskContext
+ * @param {{enableCaptureDump:boolean}} options
  */
-async function openTargetAndDispatchTask(targetConfig, finalText) {
-  const targetUrl = buildTargetUrl(targetConfig, finalText);
+async function openTargetAndDispatchTask(targetConfig, finalText, taskContext, options) {
+  const targetUrl = buildTargetUrl(targetConfig, finalText, taskContext, options);
   logInfo('Opening target tab with payload.', {
     targetSite: targetConfig.id,
     targetName: targetConfig.name,
     targetUrl,
+    taskId: taskContext.taskId,
     payloadLength: finalText.length
   });
 
@@ -336,7 +1261,8 @@ async function openTargetAndDispatchTask(targetConfig, finalText) {
   logInfo('Target tab created.', {
     targetSite: targetConfig.id,
     targetName: targetConfig.name,
-    tabId: createdTab?.id ?? null
+    tabId: createdTab?.id ?? null,
+    taskId: taskContext.taskId
   });
 
   if (createdTab?.id === undefined) {
@@ -345,16 +1271,19 @@ async function openTargetAndDispatchTask(targetConfig, finalText) {
   }
 
   // Always deliver via runtime message for consistent behavior across target sites.
-  attachTaskDeliveryListener(targetConfig.id, targetConfig.name, createdTab.id, finalText);
+  attachTaskDeliveryListener(targetConfig.id, targetConfig.name, createdTab.id, finalText, taskContext);
 }
 
 /**
  * Executes the main send flow from a browser tab context.
  * @param {chrome.tabs.Tab|undefined} tab
+ * @param {{enableCaptureDump?:boolean}|undefined} options
  */
-async function runSendFlow(tab) {
+async function runSendFlow(tab, options) {
   try {
     const currentUrl = tab?.url;
+    const rawTitle = typeof tab?.title === 'string' ? tab.title.trim() : '';
+    const sourceTitle = rawTitle || currentUrl || '';
     logInfo('Read active tab URL.', { currentUrl: currentUrl || null });
     if (!currentUrl || !/^https?:\/\//.test(currentUrl)) {
       console.error('Unsupported or empty URL:', currentUrl);
@@ -368,9 +1297,107 @@ async function runSendFlow(tab) {
 
     const targetSettings = await loadTargetSettings();
     const targetConfigs = resolveEnabledTargetConfigs(targetSettings);
-    await Promise.all(targetConfigs.map((targetConfig) => openTargetAndDispatchTask(targetConfig, finalText)));
+
+    const sendOptions = {
+      enableCaptureDump: options?.enableCaptureDump === true
+    };
+
+    await Promise.all(
+      targetConfigs.map((targetConfig) => {
+        const taskContext = {
+          taskId: generateTaskId(targetConfig.id),
+          sourceUrl: currentUrl,
+          sourceTitle
+        };
+        return openTargetAndDispatchTask(targetConfig, finalText, taskContext, sendOptions);
+      })
+    );
+
+    return {
+      ok: true,
+      targetCount: targetConfigs.length
+    };
   } catch (error) {
     console.error('Failed to trigger target auto-send flow:', error);
+    return {
+      ok: false,
+      error: String(error)
+    };
+  }
+}
+
+/**
+ * Handles test-only send flow trigger for headless E2E verification.
+ * This keeps production entrypoints unchanged while allowing deterministic automation.
+ * @param {{sourceUrl?: string, sourceTitle?: string}} message
+ * @returns {Promise<{ok:boolean,targetCount?:number,error?:string}>}
+ */
+async function handleTestTriggerSendFlow(message) {
+  const sourceUrl = typeof message.sourceUrl === 'string' ? message.sourceUrl.trim() : '';
+  const sourceTitle = typeof message.sourceTitle === 'string' ? message.sourceTitle.trim() : '';
+
+  if (sourceUrl) {
+    if (!/^https?:\/\//.test(sourceUrl)) {
+      return {
+        ok: false,
+        error: 'Invalid sourceUrl for test trigger.'
+      };
+    }
+
+    return runSendFlow(
+      {
+        url: sourceUrl,
+        title: sourceTitle || sourceUrl
+      },
+      {
+        enableCaptureDump: true
+      }
+    );
+  }
+
+  try {
+    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    return runSendFlow(tabs[0], {
+      enableCaptureDump: true
+    });
+  } catch (error) {
+    return {
+      ok: false,
+      error: String(error)
+    };
+  }
+}
+
+/**
+ * Installs a minimal test API on service worker global scope.
+ * CDP-based harness can call this API directly in headless mode.
+ */
+function installServiceWorkerTestApi() {
+  try {
+    self.__OMNISTITCH_TEST_API__ = {
+      /**
+       * Runs send flow with explicit source page values.
+       * @param {string} sourceUrl
+       * @param {string} sourceTitle
+       * @returns {Promise<{ok:boolean,targetCount?:number,error?:string}>}
+       */
+      runSendFlowFromSource: async (sourceUrl, sourceTitle) => {
+        return handleTestTriggerSendFlow({
+          sourceUrl,
+          sourceTitle
+        });
+      },
+
+      /**
+       * Runs send flow based on current active tab context.
+       * @returns {Promise<{ok:boolean,targetCount?:number,error?:string}>}
+       */
+      runSendFlowFromActiveTab: async () => {
+        return handleTestTriggerSendFlow({});
+      }
+    };
+  } catch (error) {
+    console.error('Failed to install service worker test API:', error);
   }
 }
 
@@ -398,4 +1425,140 @@ chrome.commands.onCommand.addListener(async (command) => {
   }
 });
 
+/**
+ * Receives AI response capture results from content scripts.
+ */
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (!message || typeof message.action !== 'string') {
+    return;
+  }
+
+  if (message.action === CAPTURE_NETWORK_TRACK_START_ACTION) {
+    const tabId = Number(sender?.tab?.id);
+    const taskId = typeof message.taskId === 'string' ? message.taskId.trim() : '';
+    const targetSite = typeof message.targetSite === 'string' ? message.targetSite.trim() : 'unknown';
+    if (!taskId || !Number.isInteger(tabId)) {
+      sendResponse({ ok: false, error: 'Invalid taskId or sender tab id for network tracking start.' });
+      return;
+    }
+
+    startWebRequestTrackingSession(taskId, tabId, targetSite);
+    sendResponse({ ok: true, taskId, tabId, targetSite });
+    return;
+  }
+
+  if (message.action === CAPTURE_NETWORK_TRACK_STOP_ACTION) {
+    const taskId = typeof message.taskId === 'string' ? message.taskId.trim() : '';
+    const reason = typeof message.reason === 'string' ? message.reason.trim() : 'content_stop';
+    if (!taskId) {
+      sendResponse({ ok: false, error: 'Missing taskId for network tracking stop.' });
+      return;
+    }
+
+    stopWebRequestTrackingSession(taskId, reason || 'content_stop');
+    sendResponse({ ok: true, taskId });
+    return;
+  }
+
+  if (message.action === CAPTURE_NETWORK_WAIT_IDLE_ACTION) {
+    const taskId = typeof message.taskId === 'string' ? message.taskId.trim() : '';
+    const timeoutMs = Number(message.timeoutMs);
+    if (!taskId) {
+      sendResponse({ ok: false, error: 'Missing taskId for network idle wait.' });
+      return;
+    }
+
+    waitForWebRequestTrackingIdle(taskId, timeoutMs)
+      .then((status) => {
+        sendResponse(status);
+      })
+      .catch((error) => {
+        sendResponse({
+          ok: false,
+          taskId,
+          timedOut: false,
+          error: String(error)
+        });
+      });
+
+    return true;
+  }
+
+  if (message.action === AI_RESPONSE_REPORT_ACTION) {
+    handleAiResponseReport(message)
+      .then((result) => {
+        sendResponse(result);
+      })
+      .catch((error) => {
+        console.error('Failed to handle AI response report:', error);
+        sendResponse({ ok: false, error: String(error) });
+      });
+
+    return true;
+  }
+
+});
+
+/**
+ * Retries queued payloads on alarm trigger.
+ */
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (!alarm || alarm.name !== SYNC_RETRY_ALARM_NAME) {
+    return;
+  }
+
+  retryQueuedSync().catch((error) => {
+    console.error('Failed to retry queued sync:', error);
+  });
+});
+
+/**
+ * Keeps retry alarm and queue state fresh when extension starts/installs.
+ */
+chrome.runtime.onStartup.addListener(() => {
+  scheduleSyncRetryAlarm().catch((error) => {
+    console.error('Failed to refresh sync retry alarm on startup:', error);
+  });
+});
+
+chrome.runtime.onInstalled.addListener(() => {
+  scheduleSyncRetryAlarm().catch((error) => {
+    console.error('Failed to refresh sync retry alarm on install:', error);
+  });
+});
+
+/**
+ * Re-evaluates queue and cache when sync settings change from options page.
+ */
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== 'local' || !changes[SYNC_TARGET_SETTINGS_KEY]) {
+    return;
+  }
+
+  retryQueuedSync().catch((error) => {
+    console.error('Failed to retry queue after sync settings changed:', error);
+  });
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  const taskId = webRequestTrackingTaskIdByTabId.get(tabId);
+  if (!taskId) {
+    return;
+  }
+
+  stopWebRequestTrackingSession(taskId, 'tab_removed');
+});
+
+if (chrome.webRequest) {
+  chrome.webRequest.onBeforeRequest.addListener(handleWebRequestBeforeRequest, { urls: ['<all_urls>'] });
+  chrome.webRequest.onCompleted.addListener(handleWebRequestFinished, { urls: ['<all_urls>'] });
+  chrome.webRequest.onErrorOccurred.addListener(handleWebRequestFinished, { urls: ['<all_urls>'] });
+} else {
+  console.error('chrome.webRequest API is unavailable. Network idle gate will be skipped.');
+}
+
 logRegisteredCommands();
+scheduleSyncRetryAlarm().catch((error) => {
+  console.error('Failed to initialize sync retry alarm:', error);
+});
+installServiceWorkerTestApi();
