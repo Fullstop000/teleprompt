@@ -36,17 +36,22 @@ async function sync(payload, settings) {
 
   // Capture dump is debug-only and must never be sent to external sync store.
   const { captureDump: _captureDump, ...sanitizedRawPayload } = payload || {};
+  const enrichedRawPayload = {
+    ...sanitizedRawPayload,
+    agentSite: payload.targetSite
+  };
 
   const response = await fetch(parsedUrl.toString(), {
     method: 'POST',
     headers,
     body: JSON.stringify({
       taskid: payload.taskId,
+      agent: payload.targetSite,
       target: payload.targetSite,
       time: payload.capturedAt,
       aiResponse: payload.aiResponse,
       sourceUrl: payload.sourceUrl,
-      raw: sanitizedRawPayload
+      raw: enrichedRawPayload
     })
   });
 

@@ -1766,6 +1766,7 @@ async function reportAssistantResponse(taskContext, responseText, captureMeta) {
   const payload = {
     action: AI_RESPONSE_REPORT_ACTION,
     taskId: taskContext.taskId,
+    agentSite: taskContext.targetSite,
     targetSite: taskContext.targetSite,
     sourceUrl: taskContext.sourceUrl,
     sourceTitle: taskContext.sourceTitle,

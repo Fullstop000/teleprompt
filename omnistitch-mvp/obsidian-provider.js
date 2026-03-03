@@ -17,7 +17,7 @@ function buildNoteMarkdown(payload) {
   return [
     '# OmniStitch AI Sync',
     `- taskid: ${payload.taskId}`,
-    `- target: ${payload.targetSite}`,
+    `- agent: ${payload.targetSite}`,
     `- time: ${payload.capturedAt}`,
     `- sourceUrl: ${payload.sourceUrl || 'N/A'}`,
     '',
@@ -57,7 +57,7 @@ function formatLocalDate(date) {
 
 /**
  * Builds one vault path for note creation:
- * Daily/OmniStitch/YYYY-MM-DD/{article title}/{target}/{timestamp}-{taskId}.md
+ * Daily/OmniStitch/YYYY-MM-DD/{article title}/{agent}/{timestamp}-{taskId}.md
  * @param {{taskId: string, targetSite: string, sourceUrl: string, sourceTitle: string, capturedAt: string}} payload
  * @returns {string}
  */

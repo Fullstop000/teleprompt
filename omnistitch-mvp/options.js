@@ -392,7 +392,7 @@ function setStatus(message) {
  */
 async function init() {
   const targetForm = document.getElementById('target-form');
-  const targetSiteCheckboxes = document.querySelectorAll('input[name="target-sites"]');
+  const targetSiteCheckboxes = document.querySelectorAll('input[name="agent-sites"]');
   const syncForm = document.getElementById('sync-form');
   const syncProviderSelect = document.getElementById('sync-provider');
   const syncAutoSyncInput = document.getElementById('sync-auto-sync');
@@ -458,16 +458,16 @@ async function init() {
       .filter((site) => VALID_TARGET_SITES.includes(site));
 
     if (selectedValues.length === 0) {
-      setStatus('请至少选择一个发送目标。');
+      setStatus('请至少选择一个发送 Agent。');
       return;
     }
 
     try {
       await saveTargetSettings({ targetSites: selectedValues });
       const targetLabels = selectedValues.map((site) => TARGET_SITE_LABELS[site] || site);
-      setStatus(`已保存跳转目标：${targetLabels.join('、')}`);
+      setStatus(`已保存 Agent：${targetLabels.join('、')}`);
     } catch (error) {
-      setStatus('保存跳转目标失败，请重试。');
+      setStatus('保存 Agent 失败，请重试。');
     }
   });
 

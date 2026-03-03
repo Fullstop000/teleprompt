@@ -75,6 +75,6 @@
 
 ## E2E 脚本
 - 回复链路校验（发送/接收/内容验证）：
-  - `node scripts/headed-e2e-response-check.mjs --target-sites=deepseek`
+  - `node scripts/headed-e2e-response-check.mjs --agent-sites=deepseek`
 - 同步存储一致性校验（校验 webhook sync-store 字段完整性 + top/raw/display 一致）：
-  - `node scripts/headed-e2e-sync-store-check.mjs --target-sites=deepseek`
+  - `node scripts/headed-e2e-sync-store-check.mjs --agent-sites=deepseek`

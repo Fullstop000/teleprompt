@@ -846,7 +846,7 @@ function buildProviderCredentialError(providerId) {
 
 /**
  * Normalizes one AI response report payload before syncing.
- * @param {{taskId?: string, targetSite?: string, sourceUrl?: string, sourceTitle?: string, aiResponse?: string, capturedAt?: string, captureMethod?: string, captureChannel?: string, captureSourceUrl?: string, captureChunkCount?: number|string, captureDurationMs?: number|string, captureDump?: string}} message
+ * @param {{taskId?: string, targetSite?: string, agentSite?: string, sourceUrl?: string, sourceTitle?: string, aiResponse?: string, capturedAt?: string, captureMethod?: string, captureChannel?: string, captureSourceUrl?: string, captureChunkCount?: number|string, captureDurationMs?: number|string, captureDump?: string}} message
  * @returns {{taskId: string, targetSite: string, sourceUrl: string, sourceTitle: string, aiResponse: string, capturedAt: string, captureMethod: string, captureChannel: string, captureSourceUrl: string, captureChunkCount: number, captureDurationMs: number}}
  */
 function normalizeAiResponsePayload(message) {
@@ -855,8 +855,13 @@ function normalizeAiResponsePayload(message) {
     throw new Error('Missing taskId for AI response report.');
   }
 
-  const targetSite =
-    typeof message.targetSite === 'string' && message.targetSite.trim() ? message.targetSite.trim() : 'unknown';
+  const targetSiteCandidate =
+    typeof message.agentSite === 'string' && message.agentSite.trim()
+      ? message.agentSite.trim()
+      : typeof message.targetSite === 'string' && message.targetSite.trim()
+        ? message.targetSite.trim()
+        : 'unknown';
+  const targetSite = targetSiteCandidate;
   const sourceUrl = typeof message.sourceUrl === 'string' ? message.sourceUrl.trim() : '';
   const sourceTitle = typeof message.sourceTitle === 'string' ? message.sourceTitle.trim() : '';
   const aiResponse = typeof message.aiResponse === 'string' ? message.aiResponse.trim() : '';
