@@ -19,6 +19,8 @@ const CAPTURE_ACK_TIMEOUT_MS = 2000;
 const CAPTURE_HARD_TIMEOUT_MS = 185000;
 const CAPTURE_DUMP_FLUSH_TIMEOUT_MS = 25000;
 const CAPTURE_NETWORK_IDLE_WAIT_TIMEOUT_MS = 7000;
+const SEND_BUTTON_WAIT_TIMEOUT_MS = 6000;
+const SEND_BUTTON_WAIT_INTERVAL_MS = 120;
 const CAPTURE_MAIN_EVENT_SOURCE = 'omnistitch_capture_main';
 const CAPTURE_CONTENT_EVENT_SOURCE = 'omnistitch_capture_content';
 const CAPTURE_EVENT_TYPES = {
@@ -34,108 +36,6 @@ const CAPTURE_EVENT_TYPES = {
 };
 const CONTENT_LOG_PREFIX = '[omnistitch][content]';
 const CAPTURE_DUMP_MAX_EVENTS = 10000;
-const TARGET_SITE_ADAPTERS = [
-  {
-    id: 'chatgpt',
-    name: 'ChatGPT',
-    responseExtractor: extractChatgptResponseText,
-    modeSwitcher: switchChatgptMode,
-    hostnames: ['chatgpt.com', 'chat.openai.com'],
-    composerSelectors: [
-      'textarea#prompt-textarea',
-      'textarea[data-id="root"]',
-      'textarea',
-      'div[contenteditable="true"][id="prompt-textarea"]',
-      'div[contenteditable="true"][role="textbox"]',
-      'div[contenteditable="true"]'
-    ],
-    sendButtonSelectors: [
-      'button[data-testid="send-button"]',
-      'button[aria-label*="Send"]',
-      'button[aria-label*="发送"]',
-      'button[type="submit"]'
-    ]
-  },
-  {
-    id: 'kimi',
-    name: 'Kimi',
-    responseExtractor: extractKimiResponseText,
-    modeSwitcher: switchKimiMode,
-    hostnames: ['kimi.com', 'www.kimi.com'],
-    composerSelectors: [
-      'div.chat-input-editor[contenteditable="true"]',
-      'textarea',
-      'div[contenteditable="true"][role="textbox"]',
-      'div[contenteditable="true"]'
-    ],
-    sendButtonSelectors: [
-      'div.send-button-container',
-      'div.chat-editor-action div.send-button-container',
-      'button[aria-label*="发送"]',
-      'button[aria-label*="Send"]',
-      'button[data-testid*="send"]',
-      'button[class*="send"]',
-      'button[type="submit"]'
-    ]
-  },
-  {
-    id: 'deepseek',
-    name: 'DeepSeek',
-    responseExtractor: extractDeepseekResponseText,
-    modeSwitcher: switchDeepseekMode,
-    hostnames: ['chat.deepseek.com'],
-    composerSelectors: [
-      'textarea[placeholder*="给 DeepSeek 发送消息"]',
-      'textarea#chat-input',
-      'div#chat-input[contenteditable="true"]',
-      'textarea[placeholder*="DeepSeek"]',
-      'textarea',
-      'div[contenteditable="true"][role="textbox"]',
-      'div[contenteditable="true"]'
-    ],
-    sendButtonSelectors: [
-      'div[role="button"]._7436101[aria-disabled="false"]',
-      'div[role="button"]._7436101:not(.ds-icon-button--disabled)',
-      'button#send-message-button',
-      'button[aria-label*="Send"]',
-      'button[aria-label*="发送"]',
-      'button[data-testid*="send"]',
-      'button[class*="send"]',
-      'button[type="submit"]',
-      'div[class*="send"]'
-    ]
-  },
-  {
-    id: 'gemini',
-    name: 'Gemini',
-    responseExtractor: extractGeminiResponseText,
-    modeSwitcher: switchGeminiMode,
-    hostnames: ['gemini.google.com'],
-    composerSelectors: [
-      'div.ql-editor.textarea[contenteditable="true"]',
-      'rich-textarea div[contenteditable="true"]',
-      'div.input-area div[contenteditable="true"]',
-      'textarea[aria-label*="Enter a prompt"]',
-      'div[role="textbox"][aria-label*="Gemini"]',
-      'textarea[placeholder*="prompt"]',
-      'textarea',
-      'div[contenteditable="true"][role="textbox"]',
-      'div[contenteditable="true"]'
-    ],
-    sendButtonSelectors: [
-      'button.send-button',
-      'button[aria-label="发送"]',
-      'button[aria-label*="Send message"]',
-      'button[aria-label*="Send"]',
-      'button[aria-label*="发送"]',
-      'button[data-test-id*="send"]',
-      'button[data-testid*="send"]',
-      'button[class*="send"]',
-      'button[type="submit"]',
-      'div[class*="send"]'
-    ]
-  }
-];
 
 let isRunning = false;
 let lastExecutedText = '';
@@ -230,231 +130,6 @@ function normalizeModeSwitchResult(result, fallbackDetail) {
   };
 }
 
-/**
- * Checks whether one HTMLElement is visible to users.
- * @param {HTMLElement} element
- * @returns {boolean}
- */
-function isVisibleElement(element) {
-  if (!(element instanceof HTMLElement)) {
-    return false;
-  }
-
-  if (element.offsetParent !== null) {
-    return true;
-  }
-
-  const style = window.getComputedStyle(element);
-  if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
-    return false;
-  }
-
-  const rect = element.getBoundingClientRect();
-  return rect.width > 0 && rect.height > 0;
-}
-
-/**
- * Reads one UI control text for mode switching heuristics.
- * @param {HTMLElement} element
- * @returns {string}
- */
-function readModeControlText(element) {
-  if (!(element instanceof HTMLElement)) {
-    return '';
-  }
-
-  return normalizeCapturedText(
-    element.innerText || element.textContent || element.getAttribute('aria-label') || element.getAttribute('title') || ''
-  );
-}
-
-/**
- * Checks whether one UI control currently looks active.
- * @param {HTMLElement} element
- * @returns {boolean}
- */
-function isActiveModeControl(element) {
-  if (!(element instanceof HTMLElement)) {
-    return false;
-  }
-
-  const ariaPressed = String(element.getAttribute('aria-pressed') || '').toLowerCase();
-  const ariaChecked = String(element.getAttribute('aria-checked') || '').toLowerCase();
-  const className = String(element.className || '').toLowerCase();
-  return (
-    ariaPressed === 'true' ||
-    ariaChecked === 'true' ||
-    /active|selected|checked|enabled|on|current/.test(className)
-  );
-}
-
-/**
- * Finds visible clickable controls for per-site mode switching.
- * @returns {HTMLElement[]}
- */
-function collectModeControls() {
-  const selectors = ['button', '[role="button"]', 'div[role="button"]'];
-  const controls = [];
-  for (const selector of selectors) {
-    const elements = Array.from(document.querySelectorAll(selector));
-    for (const element of elements) {
-      if (!(element instanceof HTMLElement)) {
-        continue;
-      }
-
-      if (!isVisibleElement(element)) {
-        continue;
-      }
-
-      controls.push(element);
-    }
-  }
-
-  return controls;
-}
-
-/**
- * Clicks one control when it is enabled and interactable.
- * @param {HTMLElement} element
- * @returns {boolean}
- */
-function clickModeControl(element) {
-  if (!(element instanceof HTMLElement)) {
-    return false;
-  }
-
-  if (element instanceof HTMLButtonElement && element.disabled) {
-    return false;
-  }
-
-  if (window.getComputedStyle(element).pointerEvents === 'none') {
-    return false;
-  }
-
-  element.click();
-  return true;
-}
-
-/**
- * Keeps current mode for ChatGPT and reports no-op.
- * @returns {Promise<{applied:boolean,detail:string,preview:string}>}
- */
-async function switchChatgptMode() {
-  return {
-    applied: true,
-    detail: 'chatgpt mode unchanged',
-    preview: ''
-  };
-}
-
-/**
- * Keeps current mode for DeepSeek and reports no-op.
- * @returns {Promise<{applied:boolean,detail:string,preview:string}>}
- */
-async function switchDeepseekMode() {
-  return {
-    applied: true,
-    detail: 'deepseek mode unchanged',
-    preview: ''
-  };
-}
-
-/**
- * Tries to switch Kimi from thinking mode to fast mode.
- * @returns {Promise<{applied:boolean,detail:string,preview:string}>}
- */
-async function switchKimiMode() {
-  const controls = collectModeControls();
-  const thinkingToggle = controls.find((element) => {
-    const text = readModeControlText(element).toLowerCase();
-    return /深度思考|思考|thinking/.test(text) && isActiveModeControl(element);
-  });
-  if (thinkingToggle && clickModeControl(thinkingToggle)) {
-    await waitMs(300);
-    return {
-      applied: true,
-      detail: 'disabled active thinking toggle',
-      preview: readModeControlText(thinkingToggle)
-    };
-  }
-
-  const fastControl = controls.find((element) => /快速|fast|标准/.test(readModeControlText(element).toLowerCase()));
-  if (fastControl && clickModeControl(fastControl)) {
-    await waitMs(300);
-    return {
-      applied: true,
-      detail: 'selected fast mode control',
-      preview: readModeControlText(fastControl)
-    };
-  }
-
-  return {
-    applied: false,
-    detail: 'no kimi fast/thinking controls matched',
-    preview: controls
-      .map((element) => readModeControlText(element))
-      .filter(Boolean)
-      .slice(0, 12)
-      .join(' | ')
-  };
-}
-
-/**
- * Tries to switch Gemini to fast/flash mode.
- * @returns {Promise<{applied:boolean,detail:string,preview:string}>}
- */
-async function switchGeminiMode() {
-  const clickByRegex = (regex) => {
-    const controls = collectModeControls();
-    const matched = controls.find((element) => regex.test(readModeControlText(element)));
-    if (!matched || !clickModeControl(matched)) {
-      return '';
-    }
-
-    return readModeControlText(matched);
-  };
-
-  const directFast = clickByRegex(/flash|快速|fast/i);
-  if (directFast) {
-    await waitMs(500);
-    return {
-      applied: true,
-      detail: 'selected fast/flash mode directly',
-      preview: directFast
-    };
-  }
-
-  const modelPicker = clickByRegex(/gemini|模型|model|pro|thinking|思考/i);
-  if (modelPicker) {
-    await waitMs(800);
-    const flashAfterOpen = clickByRegex(/flash|快速|fast/i);
-    if (flashAfterOpen) {
-      await waitMs(500);
-      return {
-        applied: true,
-        detail: 'opened model picker then selected fast/flash',
-        preview: flashAfterOpen
-      };
-    }
-
-    return {
-      applied: false,
-      detail: 'model picker clicked but no fast/flash option found',
-      preview: modelPicker
-    };
-  }
-
-  const controls = collectModeControls();
-  return {
-    applied: false,
-    detail: 'no gemini fast/thinking controls matched',
-    preview: controls
-      .map((element) => readModeControlText(element))
-      .filter(Boolean)
-      .slice(0, 12)
-      .join(' | ')
-  };
-}
 
 /**
  * Appends one text fragment while removing empty/duplicate fragments.
@@ -556,8 +231,20 @@ function collectAssistantTextFromMessage(message, output) {
     return;
   }
 
+  const roleCandidates = [];
   const role = typeof message.role === 'string' ? message.role.trim().toLowerCase() : '';
-  if (role && role !== 'assistant' && role !== 'model') {
+  if (role) {
+    roleCandidates.push(role);
+  }
+  const author = message.author && typeof message.author === 'object' ? message.author : null;
+  const authorRole = author && typeof author.role === 'string' ? author.role.trim().toLowerCase() : '';
+  if (authorRole) {
+    roleCandidates.push(authorRole);
+  }
+
+  const hasExplicitRole = roleCandidates.length > 0;
+  const isAssistantLike = roleCandidates.some((item) => item === 'assistant' || item === 'model');
+  if (hasExplicitRole && !isAssistantLike) {
     return;
   }
 
@@ -619,188 +306,6 @@ function collectStructuredPayloads(rawText) {
 }
 
 /**
- * Site-specific response extractor for ChatGPT capture payload.
- * @param {string} rawText
- * @returns {string}
- */
-function extractChatgptResponseText(rawText) {
-  const payloads = collectStructuredPayloads(rawText);
-  const fragments = [];
-
-  for (const payload of payloads) {
-    if (!payload || typeof payload !== 'object') {
-      continue;
-    }
-
-    collectAssistantTextFromMessage(payload.message, fragments);
-    if (payload.v && typeof payload.v === 'object') {
-      collectAssistantTextFromMessage(payload.v.message, fragments);
-      appendUniqueTextFragment(fragments, payload.v.output_text);
-    }
-
-    if (Array.isArray(payload.choices)) {
-      for (const choice of payload.choices) {
-        if (!choice || typeof choice !== 'object') {
-          continue;
-        }
-        appendUniqueTextFragment(fragments, choice.text);
-        appendUniqueTextFragment(fragments, choice.delta && choice.delta.content);
-        if (choice.message && typeof choice.message === 'object') {
-          collectAssistantTextFromMessage(choice.message, fragments);
-        }
-      }
-    }
-  }
-
-  return removeIntermediateStatusLines(fragments.join('\n'));
-}
-
-/**
- * Site-specific response extractor for Kimi capture payload.
- * @param {string} rawText
- * @returns {string}
- */
-function extractKimiResponseText(rawText) {
-  const payloads = collectStructuredPayloads(rawText);
-  const fragments = [];
-
-  /**
-   * Picks latest chat message content from Kimi ListChats payload.
-   * @param {Array<unknown>} chats
-   * @returns {string}
-   */
-  const pickLatestChatMessageContent = (chats) => {
-    if (!Array.isArray(chats) || chats.length === 0) {
-      return '';
-    }
-
-    let bestContent = '';
-    let bestScore = Number.NEGATIVE_INFINITY;
-    for (let index = 0; index < chats.length; index += 1) {
-      const chat = chats[index];
-      if (!chat || typeof chat !== 'object') {
-        continue;
-      }
-
-      const content = normalizeCapturedText(chat.messageContent || '');
-      if (!content) {
-        continue;
-      }
-
-      const updateTimeMs = Date.parse(String(chat.updateTime || chat.createTime || ''));
-      const score = Number.isFinite(updateTimeMs) ? updateTimeMs : chats.length - index;
-      if (score > bestScore) {
-        bestScore = score;
-        bestContent = content;
-      }
-    }
-
-    return bestContent;
-  };
-
-  for (const payload of payloads) {
-    if (!payload || typeof payload !== 'object') {
-      continue;
-    }
-
-    const role =
-      typeof payload.role === 'string'
-        ? payload.role.trim().toLowerCase()
-        : typeof payload.message?.role === 'string'
-          ? payload.message.role.trim().toLowerCase()
-          : '';
-    if (role && role !== 'assistant' && role !== 'model') {
-      continue;
-    }
-
-    const blockText =
-      payload.block && payload.block.text && typeof payload.block.text === 'object' ? payload.block.text.content : '';
-    appendUniqueTextFragment(fragments, blockText);
-    collectAssistantTextFromMessage(payload.message, fragments);
-
-    if (Array.isArray(payload.chats)) {
-      appendUniqueTextFragment(fragments, pickLatestChatMessageContent(payload.chats));
-    }
-  }
-
-  return removeIntermediateStatusLines(fragments.join('\n'));
-}
-
-/**
- * Site-specific response extractor for DeepSeek capture payload.
- * @param {string} rawText
- * @returns {string}
- */
-function extractDeepseekResponseText(rawText) {
-  const payloads = collectStructuredPayloads(rawText);
-  const fragments = [];
-
-  for (const payload of payloads) {
-    if (!payload || typeof payload !== 'object') {
-      continue;
-    }
-
-    if (Array.isArray(payload.choices)) {
-      for (const choice of payload.choices) {
-        if (!choice || typeof choice !== 'object') {
-          continue;
-        }
-
-        appendUniqueTextFragment(fragments, choice.delta && choice.delta.content);
-        appendUniqueTextFragment(fragments, choice.text);
-        collectAssistantTextFromMessage(choice.message, fragments);
-      }
-    }
-
-    collectAssistantTextFromMessage(payload.message, fragments);
-  }
-
-  return removeIntermediateStatusLines(fragments.join('\n'));
-}
-
-/**
- * Site-specific response extractor for Gemini capture payload.
- * @param {string} rawText
- * @returns {string}
- */
-function extractGeminiResponseText(rawText) {
-  const payloads = collectStructuredPayloads(rawText);
-  const fragments = [];
-
-  for (const payload of payloads) {
-    if (!payload || typeof payload !== 'object') {
-      continue;
-    }
-
-    if (Array.isArray(payload.candidates)) {
-      for (const candidate of payload.candidates) {
-        if (!candidate || typeof candidate !== 'object') {
-          continue;
-        }
-
-        if (candidate.content && typeof candidate.content === 'object' && Array.isArray(candidate.content.parts)) {
-          for (const part of candidate.content.parts) {
-            if (!part || typeof part !== 'object') {
-              continue;
-            }
-            appendUniqueTextFragment(fragments, part.text);
-            appendUniqueTextFragment(fragments, part.content);
-          }
-        }
-
-        appendUniqueTextFragment(fragments, candidate.output_text);
-        appendUniqueTextFragment(fragments, candidate.text);
-      }
-    }
-
-    collectAssistantTextFromMessage(payload.message, fragments);
-    appendUniqueTextFragment(fragments, payload.output_text);
-  }
-
-  return removeIntermediateStatusLines(fragments.join('\n'));
-}
-
-/**
  * Runs site-specific mode switching before prompt send.
  * @param {{id:string,name:string,modeSwitcher?:Function}} adapter
  * @returns {Promise<{applied:boolean,detail:string,preview:string}>}
@@ -827,13 +332,27 @@ async function runAdapterModeSwitcher(adapter) {
 }
 
 /**
+ * Reads target adapters from registry scripts loaded before content runtime.
+ * @returns {Array<{id:string,name:string,responseExtractor?:Function,modeSwitcher?:Function,hostnames:string[],composerSelectors:string[],sendButtonSelectors:string[]}>}
+ */
+function getTargetSiteAdapters() {
+  const adapters = globalThis.TARGET_SITE_ADAPTERS;
+  if (!Array.isArray(adapters)) {
+    console.error('Target adapter registry is missing or invalid.');
+    return [];
+  }
+
+  return adapters;
+}
+
+/**
  * Detects current target site adapter from location hostname.
  * @returns {{id:string,name:string,responseExtractor?:Function,modeSwitcher?:Function,hostnames:string[],composerSelectors:string[],sendButtonSelectors:string[]} | null}
  */
 function detectCurrentSiteAdapter() {
   const hostname = window.location.hostname.toLowerCase();
 
-  for (const adapter of TARGET_SITE_ADAPTERS) {
+  for (const adapter of getTargetSiteAdapters()) {
     const isMatch = adapter.hostnames.some(
       (domain) => hostname === domain || hostname.endsWith(`.${domain}`)
     );
@@ -855,7 +374,7 @@ function getSiteAdapterById(siteId) {
     return null;
   }
 
-  for (const adapter of TARGET_SITE_ADAPTERS) {
+  for (const adapter of getTargetSiteAdapters()) {
     if (adapter.id === siteId) {
       return adapter;
     }
@@ -1070,6 +589,47 @@ function findSendButton(adapter, composer) {
 }
 
 /**
+ * Checks whether one send button is currently interactable.
+ * @param {HTMLElement|null} sendButton
+ * @returns {boolean}
+ */
+function isSendButtonInteractable(sendButton) {
+  if (!(sendButton instanceof HTMLElement)) {
+    return false;
+  }
+
+  if (sendButton instanceof HTMLButtonElement && sendButton.disabled) {
+    return false;
+  }
+
+  if (sendButton.getAttribute('aria-disabled') === 'true') {
+    return false;
+  }
+
+  return getComputedStyle(sendButton).pointerEvents !== 'none';
+}
+
+/**
+ * Waits for an interactable send button near composer, then globally.
+ * @param {{id:string,name:string,sendButtonSelectors:string[]}} adapter
+ * @param {HTMLElement} composer
+ * @returns {Promise<HTMLElement|null>}
+ */
+async function waitForSendButton(adapter, composer) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < SEND_BUTTON_WAIT_TIMEOUT_MS) {
+    const sendButton = findSendButton(adapter, composer);
+    if (isSendButtonInteractable(sendButton)) {
+      return sendButton;
+    }
+
+    await waitMs(SEND_BUTTON_WAIT_INTERVAL_MS);
+  }
+
+  return null;
+}
+
+/**
  * Fills text into composer and dispatches input event for framework state sync.
  * @param {HTMLElement} composer
  * @param {string} text
@@ -1088,23 +648,26 @@ function fillComposer(composer, text) {
 }
 
 /**
- * Attempts to trigger send action via button click, then Enter key fallback.
+ * Attempts to trigger send action via button click, then keyboard/form fallback.
  * @param {{id:string,name:string,sendButtonSelectors:string[]}} adapter
  * @param {HTMLElement} composer
+ * @returns {Promise<{method:string,buttonFound:boolean,clicked:boolean,formSubmitAttempted:boolean}>}
  */
-function triggerSend(adapter, composer) {
-  const sendButton = findSendButton(adapter, composer);
-  if (
-    sendButton &&
-    (!(sendButton instanceof HTMLButtonElement) || !sendButton.disabled) &&
-    getComputedStyle(sendButton).pointerEvents !== 'none'
-  ) {
+async function triggerSend(adapter, composer) {
+  const sendButton = await waitForSendButton(adapter, composer);
+  if (sendButton) {
     logInfo('Clicking send button.', { site: adapter.id });
     sendButton.click();
-    return;
+    return {
+      method: 'button_click',
+      buttonFound: true,
+      clicked: true,
+      formSubmitAttempted: false
+    };
   }
 
   logInfo('Send button unavailable, fallback to Enter key.', { site: adapter.id });
+  composer.focus();
   composer.dispatchEvent(
     new KeyboardEvent('keydown', {
       key: 'Enter',
@@ -1115,6 +678,46 @@ function triggerSend(adapter, composer) {
       cancelable: true
     })
   );
+
+  composer.dispatchEvent(
+    new KeyboardEvent('keypress', {
+      key: 'Enter',
+      code: 'Enter',
+      which: 13,
+      keyCode: 13,
+      bubbles: true,
+      cancelable: true
+    })
+  );
+
+  composer.dispatchEvent(
+    new KeyboardEvent('keyup', {
+      key: 'Enter',
+      code: 'Enter',
+      which: 13,
+      keyCode: 13,
+      bubbles: true,
+      cancelable: true
+    })
+  );
+
+  let formSubmitAttempted = false;
+  const form = composer.closest('form');
+  if (form instanceof HTMLFormElement) {
+    formSubmitAttempted = true;
+    if (typeof form.requestSubmit === 'function') {
+      form.requestSubmit();
+    } else {
+      form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    }
+  }
+
+  return {
+    method: 'keyboard_fallback',
+    buttonFound: false,
+    clicked: false,
+    formSubmitAttempted
+  };
 }
 
 /**
@@ -1158,6 +761,72 @@ function normalizeCapturedText(text) {
     .replace(/\n{3,}/g, '\n\n')
     .replace(/[ \t]{2,}/g, ' ')
     .trim();
+}
+
+/**
+ * Removes leading prompt echo from captured assistant response text.
+ * Keeps the original response when cleanup result is too short.
+ * @param {string} responseText
+ * @param {string} promptText
+ * @returns {string}
+ */
+function stripPromptEcho(responseText, promptText) {
+  const normalizedResponse = normalizeCapturedText(responseText);
+  if (!normalizedResponse) {
+    return '';
+  }
+
+  const normalizedPrompt = normalizeCapturedText(promptText);
+  if (!normalizedPrompt) {
+    return normalizedResponse;
+  }
+
+  const normalizedPromptLines = normalizedPrompt
+    .split('\n')
+    .map((line) => normalizeCapturedText(line))
+    .filter(Boolean);
+  if (normalizedPromptLines.length === 0) {
+    return normalizedResponse;
+  }
+
+  let cleaned = normalizedResponse;
+  if (cleaned.startsWith(normalizedPrompt)) {
+    cleaned = normalizeCapturedText(cleaned.slice(normalizedPrompt.length));
+  }
+
+  const responseLines = cleaned
+    .split('\n')
+    .map((line) => normalizeCapturedText(line))
+    .filter(Boolean);
+  while (responseLines.length > 0 && normalizedPromptLines.includes(responseLines[0])) {
+    responseLines.shift();
+  }
+
+  cleaned = normalizeCapturedText(responseLines.join('\n'));
+  return cleaned.length >= MIN_RESPONSE_TEXT_LENGTH ? cleaned : normalizedResponse;
+}
+
+/**
+ * Removes source URL echoes from assistant response text for stable reporting.
+ * @param {string} responseText
+ * @param {string} sourceUrl
+ * @returns {string}
+ */
+function stripSourceUrlEcho(responseText, sourceUrl) {
+  const normalizedResponse = normalizeCapturedText(responseText);
+  const normalizedSourceUrl = normalizeCapturedText(sourceUrl);
+  if (!normalizedResponse || !normalizedSourceUrl) {
+    return normalizedResponse;
+  }
+
+  const withoutRawUrl = normalizeCapturedText(
+    normalizedResponse.split(normalizedSourceUrl).join('')
+  );
+  const cleanedLines = withoutRawUrl
+    .split('\n')
+    .map((line) => normalizeCapturedText(line))
+    .filter((line) => line && line !== normalizedSourceUrl && !line.includes(normalizedSourceUrl));
+  return normalizeCapturedText(cleanedLines.join('\n'));
 }
 
 const INTERMEDIATE_STATUS_PATTERNS = [
@@ -2198,7 +1867,15 @@ async function runWithText(finalText, preferredSiteId, incomingTaskContext) {
 
     // Give UI state a short time to enable send action.
     await waitMs(500);
-    triggerSend(adapter, composer);
+    const sendResult = await triggerSend(adapter, composer);
+    logInfo('Trigger send finished.', {
+      site: adapter.id,
+      taskId: taskContext.taskId,
+      method: sendResult.method,
+      buttonFound: sendResult.buttonFound,
+      clicked: sendResult.clicked,
+      formSubmitAttempted: sendResult.formSubmitAttempted
+    });
 
     if (!capturePromise) {
       console.error('Network capture session unavailable, skip response reporting.', {
@@ -2210,16 +1887,27 @@ async function runWithText(finalText, preferredSiteId, incomingTaskContext) {
 
     try {
       const captureResult = await capturePromise;
+      const promptStrippedResponseText = stripPromptEcho(captureResult.responseText, finalText);
+      const sanitizedResponseText = stripSourceUrlEcho(promptStrippedResponseText, taskContext.sourceUrl);
+      if (sanitizedResponseText !== captureResult.responseText) {
+        logInfo('Prompt echo removed from captured response.', {
+          site: adapter.id,
+          taskId: taskContext.taskId,
+          beforeLength: captureResult.responseText.length,
+          afterLength: sanitizedResponseText.length
+        });
+      }
+
       await reportAssistantResponse(
         taskContext,
-        captureResult.responseText,
+        sanitizedResponseText,
         captureResult.captureMeta,
         captureResult.captureDump
       );
       logInfo('Assistant response captured and reported via network intercept.', {
         site: adapter.id,
         taskId: taskContext.taskId,
-        responseLength: captureResult.responseText.length,
+        responseLength: sanitizedResponseText.length,
         captureChannel: captureResult.captureMeta.captureChannel,
         captureChunkCount: captureResult.captureMeta.captureChunkCount,
         captureDumpLength: typeof captureResult.captureDump === 'string' ? captureResult.captureDump.length : 0
@@ -2227,10 +1915,12 @@ async function runWithText(finalText, preferredSiteId, incomingTaskContext) {
     } catch (captureError) {
       const fallbackCaptureDump =
         captureError && typeof captureError.captureDump === 'string' ? captureError.captureDump : '';
-      const fallbackResponseText =
+      const fallbackRawResponseText =
         captureError && typeof captureError.fallbackResponseText === 'string'
           ? captureError.fallbackResponseText
           : '[capture-failed-debug]';
+      const fallbackPromptStripped = stripPromptEcho(fallbackRawResponseText, finalText);
+      const fallbackResponseText = stripSourceUrlEcho(fallbackPromptStripped, taskContext ? taskContext.sourceUrl : '');
       const fallbackCaptureMeta =
         captureError && captureError.fallbackCaptureMeta && typeof captureError.fallbackCaptureMeta === 'object'
           ? captureError.fallbackCaptureMeta

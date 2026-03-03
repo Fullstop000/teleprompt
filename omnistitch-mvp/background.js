@@ -1362,6 +1362,11 @@ function generateTaskId(targetSite) {
 function buildTargetUrl(targetConfig, finalText, taskContext) {
   try {
     const url = new URL(targetConfig.baseUrl);
+    if (targetConfig.id === 'chatgpt') {
+      // Force ChatGPT temporary chat mode to avoid polluting normal conversation history.
+      url.searchParams.set('temporary-chat', 'true');
+    }
+
     if (targetConfig.promptParam) {
       url.searchParams.set(targetConfig.promptParam, finalText);
     }

@@ -41,6 +41,11 @@
         "https://gemini.google.com/*"
       ],
       "js": [
+        "targets/capture/capture-common.js",
+        "targets/capture/chatgpt-capture.js",
+        "targets/capture/kimi-capture.js",
+        "targets/capture/deepseek-capture.js",
+        "targets/capture/gemini-capture.js",
         "response-capture-main.js"
       ],
       "all_frames": true,
@@ -57,6 +62,12 @@
         "https://gemini.google.com/*"
       ],
       "js": [
+        "targets/target-common.js",
+        "targets/chatgpt-target.js",
+        "targets/kimi-target.js",
+        "targets/deepseek-target.js",
+        "targets/gemini-target.js",
+        "targets/target-site-adapters.js",
         "content.js"
       ],
       "run_at": "document_idle"
